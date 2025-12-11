@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . /app
 
-EXPOSE 8080
+EXPOSE 9090
 
 CMD ["bash", "-lc", "python local_trade_worker.py & python web_app.py"]
 

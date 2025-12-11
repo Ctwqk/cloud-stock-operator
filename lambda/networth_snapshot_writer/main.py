@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict
 
 import boto3
@@ -52,8 +53,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     summary_resp = table.get_item(Key={"PK": pk, "SK": sk_summary})
     summary = summary_resp.get("Item") or {}
 
-    cash = float(summary.get("current_cash_managed", 0.0))
-    positions_value = float(summary.get("positions_value", 0.0))
+    # DynamoDB requires Decimal for numeric types; convert carefully.
+    raw_cash = summary.get("current_cash_managed", Decimal("0"))
+    raw_positions = summary.get("positions_value", Decimal("0"))
+
+    cash = raw_cash if isinstance(raw_cash, Decimal) else Decimal(str(raw_cash))
+    positions_value = (
+        raw_positions if isinstance(raw_positions, Decimal) else Decimal(str(raw_positions))
+    )
     net_worth = cash + positions_value
 
     timestamp = _now_iso()

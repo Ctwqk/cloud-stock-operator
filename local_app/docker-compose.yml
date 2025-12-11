@@ -3,7 +3,7 @@ services:
     build: .
     image: trading-local
     ports:
-      - "8080:8080"
+      - "9090:9090"
     environment:
       - AWS_REGION
       - AWS_DEFAULT_REGION

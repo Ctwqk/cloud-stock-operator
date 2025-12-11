@@ -1,6 +1,7 @@
 import json
 import os
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, List
 
 import boto3
@@ -16,7 +17,13 @@ sts = boto3.client("sts")
 
 try:
     import yfinance as yf  # type: ignore[import-not-found]
-except ImportError:
+except ImportError as exc:
+    # Log the real import error so it is visible in CloudWatch,
+    # then fall back to "no yfinance" mode.
+    import traceback
+
+    print("ERROR: Failed to import yfinance in NewsFetcherLambda:", exc)
+    traceback.print_exc()
     yf = None  # type: ignore[assignment]
 
 _ACCOUNT_ID_CACHE: str | None = None
@@ -137,19 +144,51 @@ def _fetch_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     now = datetime.now(timezone.utc).isoformat()
     for n in raw_items[:max_items]:
+        # yfinance may return either a flat dict with title/summary or a nested
+        # structure under "content" (as in Yahoo Finance video/news objects).
+        content = n.get("content") or n
+
+        title = (content.get("title") or "").strip()
+        summary = (content.get("summary") or content.get("description") or "").strip()
+
+        # Prefer explicit publisher/provider fields, otherwise fall back.
+        provider = (
+            content.get("publisher")
+            or (content.get("provider") or {}).get("displayName")
+            or n.get("publisher")
+            or "yfinance"
+        )
+
         published_ts = n.get("providerPublishTime")
         if published_ts:
             published_at = datetime.fromtimestamp(
                 published_ts, tz=timezone.utc
             ).isoformat()
         else:
-            published_at = now
+            # Fallback to pubDate if present, else "now".
+            pub_date = content.get("pubDate")
+            if isinstance(pub_date, str) and pub_date:
+                try:
+                    # Handle trailing "Z" by normalizing to +00:00
+                    dt = datetime.fromisoformat(
+                        pub_date.replace("Z", "+00:00")
+                    )
+                    published_at = dt.astimezone(timezone.utc).isoformat()
+                except Exception:
+                    published_at = now
+            else:
+                published_at = now
+
+        # Skip completely empty news (no title and no summary).
+        if not title and not summary:
+            continue
+
         items.append(
             {
                 "symbol": symbol,
-                "headline": n.get("title") or "",
-                "body": n.get("summary") or "",
-                "source": n.get("publisher") or "yfinance",
+                "headline": title,
+                "body": summary,
+                "source": provider,
                 "published_at": published_at,
             }
         )
@@ -199,7 +238,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 Key={"PK": f"ACCOUNT#{account_id}", "SK": f"STOCK#{symbol}"},
                 UpdateExpression="SET last_fetched_price = :p, updated_at = :u",
                 ExpressionAttributeValues={
-                    ":p": last_price,
+                    # DynamoDB expects Decimal, not float
+                    ":p": Decimal(str(last_price)),
                     ":u": datetime.now(timezone.utc).isoformat(),
                 },
             )

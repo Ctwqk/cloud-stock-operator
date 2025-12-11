@@ -1,6 +1,7 @@
 import json
 import os
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict
 
 import boto3
@@ -64,8 +65,9 @@ def _handle_add_stock(msg: Dict[str, Any], table) -> None:
 
 def _handle_adjust_managed_cash(msg: Dict[str, Any], table) -> None:
     account_id = msg["account_id"]
-    delta_cash = float(msg["delta_cash"])
-    max_allowed_cash = float(msg["max_allowed_cash"])
+    # DynamoDB numeric attributes must be Decimal, not float
+    delta_cash = Decimal(str(msg["delta_cash"]))
+    max_allowed_cash = Decimal(str(msg["max_allowed_cash"]))
 
     pk = f"ACCOUNT#{account_id}"
     sk = "SUMMARY"
@@ -78,7 +80,7 @@ def _handle_adjust_managed_cash(msg: Dict[str, Any], table) -> None:
         ExpressionAttributeValues={
             ":delta": delta_cash,
             ":max": max_allowed_cash,
-            ":zero": 0.0,
+            ":zero": Decimal("0"),
             ":u": _now_iso(),
         },
     )

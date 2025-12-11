@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-REGION="us-west-1"
+REGION="us-east-1"
 
 echo "Fetching stack outputs from region $REGION..."
 

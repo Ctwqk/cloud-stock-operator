@@ -1,0 +1,1 @@
+# cloud-stock-operator

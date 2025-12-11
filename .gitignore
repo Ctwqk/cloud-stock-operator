@@ -1,0 +1,40 @@
+# Python artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# CDK / build outputs
+cdk.out/
+**/cdk.out/
+.aws-sam/
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local environment / secrets
+.env
+.env.*
+
+# Lambda layers and large local artifacts
+lambda_layers/
+layers/
+yfinance-layer.zip
+matplotlib-layer.zip
+
+

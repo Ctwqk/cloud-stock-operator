@@ -1,0 +1,12 @@
+aws-cdk-lib>=2.150.0,<3.0.0
+constructs>=10.0.0,<11.0.0
+
+# Optional but commonly used in Lambda handlers and local tools.
+# You can move these into function-specific deployment packages if desired.
+boto3>=1.34.0
+matplotlib>=3.8.0
+numpy>=1.26.0
+Flask>=3.0.0
+requests>=2.32.0
+
+

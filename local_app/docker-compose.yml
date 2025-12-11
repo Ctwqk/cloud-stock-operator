@@ -1,0 +1,18 @@
+services:
+  trading-app:
+    build: .
+    image: trading-local
+    ports:
+      - "8080:8080"
+    environment:
+      - AWS_REGION
+      - AWS_DEFAULT_REGION
+      - TABLE_NAME
+      - SYSTEM_OPS_QUEUE_URL
+      - MGMT_API_BASE_URL
+      - NETWORTH_API_BASE_URL
+      # If you use a named profile other than 'default', uncomment and set this:
+      # - AWS_PROFILE=default
+    volumes:
+      # Mount local AWS credentials so boto3 inside container can authenticate
+      - ~/.aws:/root/.aws:ro

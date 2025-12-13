@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-REGION="us-east-1"
+REGION="us-west-1"
 
 echo "Fetching stack outputs from region $REGION..."
 
@@ -43,11 +43,15 @@ export AWS_REGION="$REGION"
 export AWS_DEFAULT_REGION="$REGION"
 export TABLE_NAME="TradingTable"
 
+# From inside Docker, 127.0.0.1 is the container, not your host.
+# Point IBKR host to the Docker host so we can reach the paper gateway.
+export IB_GATEWAY_HOST="host.docker.internal"
+
 # Run detached
 docker compose up --build -d
 
 echo ""
 echo "✅ Local app is running in background!"
-echo "➡️  Frontend: http://localhost:8080"
+echo "➡️  Frontend: http://localhost:9090"
 echo "➡️  Logs:     docker compose logs -f"
 echo "➡️  Stop:     docker compose down"

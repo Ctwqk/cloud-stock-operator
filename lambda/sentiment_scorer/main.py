@@ -59,7 +59,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Flow per news item:
       1. Sample random sentiment r in {+1, 0, -1}.
       2. Read watchlist entry: PK=ACCOUNT#<account_id>, SK=STOCK#<symbol>.
-      3. Update current_level_score += r, set threshold_abs=3 if missing.
+      3. Update current_level_score += r, set threshold_abs=1 if missing.
       4. If |score| >= threshold_abs, publish AUTO_TRADE_DECISION to SystemOpsTopic.
     """
     table = dynamodb.Table(TABLE_NAME)
@@ -83,7 +83,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         resp = table.get_item(Key={"PK": pk, "SK": sk})
         item = resp.get("Item") or {}
         current_score = int(item.get("current_level_score", 0))
-        threshold_abs = int(item.get("threshold_abs", 3))
+        # Default absolute threshold is 1 (i.e., any non-zero score can trigger a decision)
+        threshold_abs = int(item.get("threshold_abs", 1))
 
         new_score = current_score + r
 

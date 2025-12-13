@@ -101,12 +101,19 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         ContentType="image/png",
     )
 
-    # For simplicity return the S3 key; you could return a presigned URL if desired.
+    # Generate a presigned URL so the local web app can display the plot directly.
+    presigned_url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": BUCKET_NAME, "Key": key},
+        ExpiresIn=3600,
+    )
+
     body = {
         "account_id": account_id,
         "start_time": start_time,
         "end_time": end_time,
         "s3_key": key,
+        "url": presigned_url,
     }
     return {
         "statusCode": 200,

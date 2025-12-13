@@ -136,6 +136,8 @@ class AppStack(Stack):
         lambda_code_path = "lambda"
 
         # S3 bucket S for news and plots (application-owned)
+        # auto_delete_objects=True so that `cdk destroy` can fully clean up
+        # the bucket (including all news/plot objects) without manual steps.
         bucket_s = s3.Bucket(
             self,
             "NewsAndPlotsBucket",
@@ -144,7 +146,7 @@ class AppStack(Stack):
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             encryption=s3.BucketEncryption.S3_MANAGED,
             removal_policy=_default_removal_policy(),
-            auto_delete_objects=False,
+            auto_delete_objects=True,
         )
 
         # Lambda A – News Fetcher
@@ -168,11 +170,11 @@ class AppStack(Stack):
         system_ops_topic.grant_publish(lambda_a)
         bucket_s.grant_write(lambda_a)
 
-        # EventBridge rule: run A every 10 minutes
+        # EventBridge rule: run A every 1 minute (for demo friendliness)
         events.Rule(
             self,
             "NewsFetcherScheduleRule",
-            schedule=events.Schedule.rate(Duration.minutes(10)),
+            schedule=events.Schedule.rate(Duration.minutes(1)),
             targets=[targets.LambdaFunction(lambda_a)],
         )
 

@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Any, Dict, List
 
 import boto3
+from botocore.exceptions import ClientError
 
 
 TABLE_NAME = os.environ.get("TABLE_NAME", "")
@@ -65,9 +66,65 @@ def _publish_external(event: Dict[str, Any]) -> None:
     if not EXTERNAL_OPS_TOPIC_ARN:
         return
     try:
-        sns.publish(TopicArn=EXTERNAL_OPS_TOPIC_ARN, Message=json.dumps(event))
+        # Some fields (e.g., Decimal) are not JSON-serializable by default.
+        # Use default=str so audit events never fail the main flow.
+        payload = json.dumps(event, default=str)
+        sns.publish(TopicArn=EXTERNAL_OPS_TOPIC_ARN, Message=payload)
     except Exception as exc:  # best-effort logging
         print(f"Failed to publish external ops event: {exc}")
+
+
+def _recompute_positions_and_net_worth(account_id: str) -> None:
+    """
+    Recompute positions_value and current_net_worth based on all STOCK# items
+    and the current_cash_managed in SUMMARY.
+    """
+    table = dynamodb.Table(TABLE_NAME)
+    pk = f"ACCOUNT#{account_id}"
+
+    # Query all STOCK# items
+    resp = table.query(
+        KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
+        ExpressionAttributeValues={
+            ":pk": pk,
+            ":sk_prefix": "STOCK#",
+        },
+    )
+    items = resp.get("Items", [])
+
+    positions_value = Decimal("0")
+    for item in items:
+        try:
+            shares_raw = item.get("shares_managed", 0)
+            price_raw = item.get("last_fetched_price", 0)
+            shares = Decimal(str(shares_raw))
+            price = Decimal(str(price_raw))
+            positions_value += shares * price
+        except Exception:
+            continue
+
+    # Read current_cash_managed
+    summary_resp = table.get_item(Key={"PK": pk, "SK": "SUMMARY"})
+    summary = summary_resp.get("Item") or {}
+    try:
+        cash_raw = summary.get("current_cash_managed", Decimal("0"))
+        cash = cash_raw if isinstance(cash_raw, Decimal) else Decimal(str(cash_raw))
+    except Exception:
+        cash = Decimal("0")
+
+    net_worth = cash + positions_value
+
+    table.update_item(
+        Key={"PK": pk, "SK": "SUMMARY"},
+        UpdateExpression=(
+            "SET positions_value = :pv, current_net_worth = :nw, updated_at = :u"
+        ),
+        ExpressionAttributeValues={
+            ":pv": positions_value,
+            ":nw": net_worth,
+            ":u": _now_iso(),
+        },
+    )
 
 
 def _handle_add_watchlist(account_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -88,7 +145,7 @@ def _handle_add_watchlist(account_id: str, body: Dict[str, Any]) -> Dict[str, An
             "symbol": symbol,
             "shares_managed": shares_managed,
             "current_level_score": 0,
-            "threshold_abs": 3,
+            "threshold_abs": 1,  # initial threshold is 1
             "is_deleted": False,
             "created_at": now,
             "updated_at": now,
@@ -160,19 +217,35 @@ def _handle_adjust_cash(account_id: str, body: Dict[str, Any]) -> Dict[str, Any]
     sk = "SUMMARY"
 
     table = dynamodb.Table(TABLE_NAME)
+
+    # Read current managed cash so we can validate in Python. DynamoDB
+    # condition expressions do not support arithmetic like "+ :delta".
+    resp = table.get_item(Key={"PK": pk, "SK": sk})
+    item = resp.get("Item") or {}
+    try:
+        current_cash = Decimal(str(item.get("current_cash_managed", "0")))
+    except Exception:
+        current_cash = Decimal("0")
+
+    new_cash = current_cash + delta_cash
+    if new_cash > max_allowed_cash:
+        return _response(
+            400,
+            {
+                "error": "managed cash would exceed allowed maximum",
+                "current_cash_managed": str(current_cash),
+                "requested_delta": str(delta_cash),
+                "max_allowed_cash": str(max_allowed_cash),
+            },
+        )
+
     table.update_item(
         Key={"PK": pk, "SK": sk},
         UpdateExpression=(
-            "SET current_cash_managed = if_not_exists(current_cash_managed, :zero) + :delta, "
-            "updated_at = :u"
-        ),
-        ConditionExpression=(
-            "if_not_exists(current_cash_managed, :zero) + :delta <= :max"
+            "SET current_cash_managed = :new, updated_at = :u"
         ),
         ExpressionAttributeValues={
-            ":delta": delta_cash,
-            ":max": max_allowed_cash,
-            ":zero": Decimal("0"),
+            ":new": new_cash,
             ":u": _now_iso(),
         },
     )
@@ -203,22 +276,40 @@ def _handle_adjust_shares(account_id: str, body: Dict[str, Any]) -> Dict[str, An
     sk = f"STOCK#{symbol}"
 
     table = dynamodb.Table(TABLE_NAME)
+
+    # Read current shares_managed so we can validate in Python.
+    resp = table.get_item(Key={"PK": pk, "SK": sk})
+    item = resp.get("Item") or {}
+    try:
+        current_shares = int(item.get("shares_managed", 0))
+    except (TypeError, ValueError):
+        current_shares = 0
+
+    new_shares = current_shares + delta_shares
+
+    if new_shares > max_shares_allowed:
+        return _response(
+            400,
+            {
+                "error": "managed shares would exceed allowed maximum",
+                "symbol": symbol,
+                "current_shares": current_shares,
+                "requested_delta": delta_shares,
+                "max_shares_allowed": max_shares_allowed,
+            },
+        )
+
     table.update_item(
         Key={"PK": pk, "SK": sk},
-        UpdateExpression=(
-            "SET shares_managed = if_not_exists(shares_managed, :zero) + :delta, "
-            "updated_at = :u"
-        ),
-        ConditionExpression=(
-            "if_not_exists(shares_managed, :zero) + :delta <= :max"
-        ),
+        UpdateExpression="SET shares_managed = :new, updated_at = :u",
         ExpressionAttributeValues={
-            ":delta": delta_shares,
-            ":max": max_shares_allowed,
-            ":zero": 0,
+            ":new": new_shares,
             ":u": _now_iso(),
         },
     )
+
+    # Recompute positions_value and current_net_worth after manual share change.
+    _recompute_positions_and_net_worth(account_id)
 
     _publish_external(
         {
@@ -231,7 +322,6 @@ def _handle_adjust_shares(account_id: str, body: Dict[str, Any]) -> Dict[str, An
     )
 
     return _response(200, {"message": "shares adjusted", "symbol": symbol})
-
 
 def _handle_set_threshold(
     account_id: str, symbol: str, body: Dict[str, Any]
@@ -266,6 +356,33 @@ def _handle_set_threshold(
     return _response(200, {"message": "threshold updated", "symbol": symbol})
 
 
+def _handle_refresh_watchlist(account_id: str) -> Dict[str, Any]:
+    """
+    Trigger an on-demand refresh for all watchlist entries:
+      - Invokes NewsFetcherLambda asynchronously for this account.
+      - NewsFetcher will update last_fetched_price and publish NEW_NEWS items.
+    """
+    if not NEWS_FETCHER_NAME:
+        return _response(500, {"error": "NEWS_FETCHER_NAME is not configured"})
+
+    try:
+        lambda_client.invoke(
+            FunctionName=NEWS_FETCHER_NAME,
+            InvocationType="Event",
+            Payload=json.dumps({"account_id": account_id}).encode("utf-8"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Failed to invoke news fetcher for refresh: {exc}")
+        return _response(500, {"error": f"failed to invoke news fetcher: {exc}"})
+
+    return _response(
+        200,
+        {
+            "message": "watchlist refresh requested; prices/news will update shortly",
+        },
+    )
+
+
 def _handle_apply_sentiment(account_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
     """
     Apply a sentiment delta (e.g., from FinBERT running in the local backend).
@@ -274,7 +391,7 @@ def _handle_apply_sentiment(account_id: str, body: Dict[str, Any]) -> Dict[str, 
       {
         "symbol": "AAPL",
         "delta_score": 1,    # integer delta to add to current_level_score
-        "threshold_abs": 3,  # optional, defaults to 3
+        "threshold_abs": 1,  # optional, defaults to 1
         "reason": "FINBERT"  # optional
       }
     """
@@ -286,7 +403,7 @@ def _handle_apply_sentiment(account_id: str, body: Dict[str, Any]) -> Dict[str, 
         return _response(400, {"error": "delta_score is required"})
 
     delta_score = int(body["delta_score"])
-    threshold_abs = int(body.get("threshold_abs", 3))
+    threshold_abs = int(body.get("threshold_abs", 1))
     reason = str(body.get("reason", "FINBERT"))
 
     pk = f"ACCOUNT#{account_id}"
@@ -409,6 +526,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if len(parts) >= 3:
             symbol = parts[1]
             return _handle_set_threshold(account_id, symbol, body)
+
+    if method == "POST" and path == "/watchlist/refresh":
+        return _handle_refresh_watchlist(account_id)
 
     if method == "POST" and path == "/sentiment":
         # Local backend (FinBERT) posts sentiment delta here.

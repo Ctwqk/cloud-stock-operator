@@ -20,7 +20,8 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict
+from decimal import Decimal
+from typing import Any, Dict, Optional
 
 import boto3
 import requests
@@ -51,6 +52,116 @@ def _run_finbert_on_text(headline: str, body: str) -> int:
     """
     # TODO: integrate real FinBERT model here. For now, always return +1.
     return 1
+
+
+_ib: Optional[object] = None  # kept only to avoid breaking references if any
+
+
+def _get_managed_cash(account_id: str) -> float:
+    """
+    Read current_cash_managed from the SUMMARY item for the account.
+    """
+    table = dynamodb.Table(TABLE_NAME)
+    resp = table.get_item(Key={"PK": f"ACCOUNT#{account_id}", "SK": "SUMMARY"})
+    item = resp.get("Item") or {}
+    value = item.get("current_cash_managed", 0)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _update_managed_cash(account_id: str, new_cash: float) -> None:
+    """
+    Persist a new current_cash_managed value to the SUMMARY item.
+    """
+    table = dynamodb.Table(TABLE_NAME)
+    table.update_item(
+        Key={"PK": f"ACCOUNT#{account_id}", "SK": "SUMMARY"},
+        UpdateExpression="SET current_cash_managed = :c, updated_at = :u",
+        ExpressionAttributeValues={
+            ":c": Decimal(str(new_cash)),
+            ":u": _now_iso(),
+        },
+    )
+
+
+def _get_last_fetched_price(account_id: str, symbol: str) -> Optional[float]:
+    """
+    Load last_fetched_price from the STOCK item, if present.
+
+    This is written by the NewsFetcher Lambda using yfinance.
+    """
+    table = dynamodb.Table(TABLE_NAME)
+    resp = table.get_item(
+        Key={"PK": f"ACCOUNT#{account_id}", "SK": f"STOCK#{symbol}"}
+    )
+    item = resp.get("Item") or {}
+    value = item.get("last_fetched_price")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _recompute_positions_and_net_worth(account_id: str) -> None:
+    """
+    Recompute positions_value and current_net_worth for the account based on
+    all STOCK# items and current_cash_managed.
+    """
+    table = dynamodb.Table(TABLE_NAME)
+    pk = f"ACCOUNT#{account_id}"
+
+    # Query all STOCK# items for this account
+    resp = table.query(
+        KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
+        ExpressionAttributeValues={
+            ":pk": pk,
+            ":sk_prefix": "STOCK#",
+        },
+    )
+    items = resp.get("Items", [])
+
+    positions_value = 0.0
+    for item in items:
+        try:
+            shares = float(item.get("shares_managed", 0) or 0)
+            price = float(item.get("last_fetched_price", 0) or 0)
+            positions_value += shares * price
+        except (TypeError, ValueError):
+            continue
+
+    # Read current_cash_managed
+    summary_resp = table.get_item(Key={"PK": pk, "SK": "SUMMARY"})
+    summary = summary_resp.get("Item") or {}
+    try:
+        cash = float(summary.get("current_cash_managed", 0) or 0)
+    except (TypeError, ValueError):
+        cash = 0.0
+
+    net_worth = cash + positions_value
+
+    table.update_item(
+        Key={"PK": pk, "SK": "SUMMARY"},
+        UpdateExpression=(
+            "SET positions_value = :pv, current_net_worth = :nw, updated_at = :u"
+        ),
+        ExpressionAttributeValues={
+            ":pv": Decimal(str(positions_value)),
+            ":nw": Decimal(str(net_worth)),
+            ":u": _now_iso(),
+        },
+    )
+
+
+def _ib_self_test() -> None:
+    """
+    IBKR is no longer used for placing real orders; this self-test is now a no-op.
+    Kept for backwards compatibility with the startup flow.
+    """
+    print(f"[{_now_iso()}] IBKR trading disabled; running in pseudo-trading mode.")
 
 
 def _handle_news_stored(msg: Dict[str, Any]) -> None:
@@ -131,15 +242,90 @@ def _handle_auto_trade_decision(msg: Dict[str, Any]) -> None:
     score = msg.get("score")
     threshold_abs = msg.get("threshold_abs")
     reason = msg.get("reason", "SCORE_THRESHOLD")
+    quantity = int(msg.get("shares", 1))
 
-    print(f"[{_now_iso()}] AUTO_TRADE_DECISION: {action} {symbol} (score={score})")
+    print(
+        f"[{_now_iso()}] AUTO_TRADE_DECISION: {action} {quantity} {symbol} "
+        f"(score={score}, threshold_abs={threshold_abs})"
+    )
+    last_price = _get_last_fetched_price(account_id, symbol)
+    notional = None
+    if last_price is not None and last_price > 0:
+        notional = last_price * quantity
 
-    # TODO: Integrate with IBKR Gateway on localhost:4001/4002 here.
-    # For example, place a market order using your IBKR Python API.
-    trade_status = "PENDING"
+    managed_cash_before = _get_managed_cash(account_id)
+    managed_cash_after = managed_cash_before
+    trade_status = "NOOP"
 
-    # Optionally, write a TRADE#... record into DynamoDB for logging.
     table = dynamodb.Table(TABLE_NAME)
+
+    if notional is None:
+        print(f"[{_now_iso()}] No valid price for {symbol}; skipping virtual trade.")
+        trade_status = "REJECTED_NO_PRICE"
+    else:
+        if action.upper() == "BUY":
+            # Pseudo-trade: ensure enough managed cash, then increase virtual position.
+            if managed_cash_before < notional:
+                print(
+                    f"[{_now_iso()}] Insufficient managed cash for BUY {quantity} {symbol}: "
+                    f"need ~{notional:.2f}, have {managed_cash_before:.2f}. Rejecting."
+                )
+                trade_status = "REJECTED_INSUFFICIENT_MANAGED_CASH"
+            else:
+                # Decrease managed cash
+                managed_cash_after = managed_cash_before - notional
+                _update_managed_cash(account_id, managed_cash_after)
+                # Increase managed shares
+                pk = f"ACCOUNT#{account_id}"
+                sk = f"STOCK#{symbol}"
+                table.update_item(
+                    Key={"PK": pk, "SK": sk},
+                    UpdateExpression=(
+                        "SET shares_managed = if_not_exists(shares_managed, :zero) + :q, "
+                        "updated_at = :u"
+                    ),
+                    ExpressionAttributeValues={
+                        ":q": quantity,
+                        ":zero": 0,
+                        ":u": _now_iso(),
+                    },
+                )
+                trade_status = "EXECUTED_VIRTUAL"
+        elif action.upper() == "SELL":
+            # Pseudo-trade: check virtual position and decrease it, then increase cash.
+            pk = f"ACCOUNT#{account_id}"
+            sk = f"STOCK#{symbol}"
+            resp = table.get_item(Key={"PK": pk, "SK": sk})
+            item = resp.get("Item") or {}
+            current_shares = int(item.get("shares_managed", 0) or 0)
+            if current_shares < quantity:
+                print(
+                    f"[{_now_iso()}] Insufficient managed shares for SELL {quantity} {symbol}: "
+                    f"have {current_shares}. Rejecting."
+                )
+                trade_status = "REJECTED_INSUFFICIENT_SHARES"
+            else:
+                new_shares = current_shares - quantity
+                table.update_item(
+                    Key={"PK": pk, "SK": sk},
+                    UpdateExpression="SET shares_managed = :new, updated_at = :u",
+                    ExpressionAttributeValues={
+                        ":new": new_shares,
+                        ":u": _now_iso(),
+                    },
+                )
+                managed_cash_after = managed_cash_before + notional
+                _update_managed_cash(account_id, managed_cash_after)
+                trade_status = "EXECUTED_VIRTUAL"
+        else:
+            print(f"[{_now_iso()}] Unknown action '{action}' in AUTO_TRADE_DECISION")
+            trade_status = "REJECTED_BAD_ACTION"
+
+    # After any executed virtual trade, recompute positions_value and net worth.
+    if trade_status == "EXECUTED_VIRTUAL":
+        _recompute_positions_and_net_worth(account_id)
+
+    # Write a TRADE#... record into DynamoDB for logging.
     ts = _now_iso()
     trade_sk = f"TRADE#{ts}"
 
@@ -153,12 +339,19 @@ def _handle_auto_trade_decision(msg: Dict[str, Any]) -> None:
             "status": trade_status,
             "score": score,
             "threshold_abs": threshold_abs,
+            "quantity": quantity,
+            "last_price": last_price,
+            "managed_cash_before": managed_cash_before,
+            "managed_cash_after": managed_cash_after,
             "created_at": ts,
         }
     )
 
 
 def main() -> None:
+    # Run a quick IBKR self-test with AAPL before entering the main loop.
+    _ib_self_test()
+
     print(f"Polling SystemOpsQueue at {SYSTEM_OPS_QUEUE_URL}")
     while True:
         resp = sqs.receive_message(

@@ -32,9 +32,7 @@ Thumbs.db
 .env.*
 
 # Lambda layers and large local artifacts
-lambda_layers/
-layers/
-yfinance-layer.zip
-matplotlib-layer.zip
+layers/build/
+*.zip
 
 

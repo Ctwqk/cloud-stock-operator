@@ -417,6 +417,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "requests" },
+    { name = "responses" },
     { name = "ruff" },
     { name = "vadersentiment" },
 ]
@@ -444,6 +445,7 @@ test = [
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "requests" },
+    { name = "responses" },
     { name = "vadersentiment" },
 ]
 
@@ -462,6 +464,7 @@ dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-cov", specifier = ">=5" },
     { name = "requests", specifier = ">=2.32" },
+    { name = "responses", specifier = ">=0.25" },
     { name = "ruff", specifier = ">=0.8" },
     { name = "vadersentiment", specifier = ">=3.3.2" },
 ]
@@ -487,6 +490,7 @@ test = [
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-cov", specifier = ">=5" },
     { name = "requests", specifier = ">=2.32" },
+    { name = "responses", specifier = ">=0.25" },
     { name = "vadersentiment", specifier = ">=3.3.2" },
 ]
 

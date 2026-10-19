@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --only-group lint
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"  # CDK assertion tests start the jsii runtime
+      - run: uv sync --frozen
+      - name: Unit, integration and CDK assertion tests
+        run: uv run --no-sync pytest --cov --cov-report=term-missing:skip-covered --cov-fail-under=85
+
+  cdk-synth:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: uv sync --frozen --no-dev
+      - name: cdk synth (offline, no AWS credentials)
+        working-directory: cdk
+        run: |
+          export PATH="$GITHUB_WORKSPACE/.venv/bin:$PATH"
+          npx --yes aws-cdk@2 synth --quiet
+          ls cdk.out/*.template.json
+
+  layers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Build Lambda layers (Linux x86_64 wheels) and check their size
+        run: ./scripts/build_layers.sh
+
+  local-demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the local demo with docker compose and wait for the first trades
+        run: ./scripts/smoke_local_demo.sh

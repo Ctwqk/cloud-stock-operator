@@ -122,7 +122,7 @@ class TestProviderSelection:
         steady = providers.FixtureProvider(path)
         drifting = providers.FixtureProvider(path, drift=True)
         seen = set()
-        for minute in range(0, 60, 5):
+        for minute in range(10):  # one drift period is 10 minutes
             monkeypatch.setattr(
                 timeutil, "now", lambda minute=minute: datetime(2025, 12, 1, 10, minute, tzinfo=UTC)
             )
@@ -131,7 +131,7 @@ class TestProviderSelection:
             assert price == drifting.last_price("AAPL")  # same instant -> same price
             assert steady.last_price("AAPL") == Decimal("100")
             seen.add(price)
-        assert len(seen) > 5  # it actually moves
+        assert len(seen) >= 8  # it actually moves
 
     def test_fixture_requires_path(self, monkeypatch):
         monkeypatch.setenv("NEWS_PROVIDER", "fixture")

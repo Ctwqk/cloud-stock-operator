@@ -374,3 +374,18 @@ def test_handler_environment_is_sufficient_for_the_pipeline(application):
     }
     for package, names in required.items():
         assert names <= declared[package], f"{package} is missing {names - declared[package]}"
+
+
+def test_cdk_app_imports_do_not_need_boto3():
+    """The CDK project only depends on aws-cdk-lib/constructs; topology must stay boto3-free."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; sys.modules['boto3'] = None; sys.path.insert(0, sys.argv[1]);"
+        "from common import topology; assert len(topology.QUEUES) == 6"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(LAMBDA_DIR)], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr

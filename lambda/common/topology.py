@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from . import messages
+from . import message_types as messages
 
 EXTERNAL_TOPIC = "external"
 SYSTEM_TOPIC = "system"

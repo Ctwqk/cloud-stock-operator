@@ -1,0 +1,2 @@
+# Lambda layer for lambda/news_fetcher (provider NEWS_PROVIDER=yfinance)
+yfinance>=0.2.50

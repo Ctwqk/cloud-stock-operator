@@ -1,125 +1,111 @@
+"""Lambda C - Net-Worth Plotter (API Gateway ``GET /networth``).
+
+Query string: ``account_id`` (optional), ``start_time`` / ``end_time`` (ISO-8601, optional).
+Renders the ``NETWORTH#`` series as a PNG into S3 (``plots/networth/<account>/<id>.png``) and
+returns its key plus a presigned URL. Bad timestamps return ``400``.
+"""
+
+from __future__ import annotations
+
 import io
-import json
-import os
+import logging
 import uuid
-from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any
 
-import boto3
-import matplotlib.pyplot as plt
+from common import aws, ddb, jsonutil, keys, timeutil
 
+logger = logging.getLogger(__name__)
 
-TABLE_NAME = os.environ.get("TABLE_NAME", "")
-BUCKET_NAME = os.environ.get("BUCKET_NAME", "")
-
-dynamodb = boto3.resource("dynamodb")
-s3 = boto3.client("s3")
-sts = boto3.client("sts")
-
-_ACCOUNT_ID_CACHE: str | None = None
+PRESIGN_SECONDS = 3600
+MAX_POINTS = 5000
 
 
-def _get_account_id() -> str:
-    """
-    Resolve AWS account id from STS once per container.
-    """
-    global _ACCOUNT_ID_CACHE
-    if _ACCOUNT_ID_CACHE is None:
-        identity = sts.get_caller_identity()
-        _ACCOUNT_ID_CACHE = identity["Account"]
-    return _ACCOUNT_ID_CACHE
+def _response(status: int, body: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "statusCode": status,
+        "headers": {"Content-Type": "application/json"},
+        "body": jsonutil.dumps(body),
+    }
 
 
-def _query_networth_points(account_id: str, start_time: str, end_time: str) -> List[Dict[str, Any]]:
-    """
-    Query net-worth time-series:
-      PK = ACCOUNT#<account_id>
-      SK between NETWORTH#start_time and NETWORTH#end_time
-    """
-    table = dynamodb.Table(TABLE_NAME)
-    sk_start = f"NETWORTH#{start_time}"
-    sk_end = f"NETWORTH#{end_time}"
-    resp = table.query(
+def query_points(account_id: str, start: str, end: str) -> list[dict[str, Any]]:
+    """Net-worth items with ``start <= timestamp <= end`` in chronological order."""
+    items = ddb.query_all(
+        aws.table(),
         KeyConditionExpression="PK = :pk AND SK BETWEEN :start AND :end",
         ExpressionAttributeValues={
-            ":pk": f"ACCOUNT#{account_id}",
-            ":start": sk_start,
-            ":end": sk_end,
+            ":pk": keys.account_pk(account_id),
+            ":start": keys.networth_sk(start),
+            ":end": keys.networth_sk(end),
         },
     )
-    return sorted(resp.get("Items", []), key=lambda x: x.get("SK", ""))
+    return sorted(items, key=lambda item: item["SK"])[-MAX_POINTS:]
 
 
-def _make_plot(points: List[Dict[str, Any]]) -> bytes:
-    """
-    Generate a simple time-series PNG plot from points.
-    """
-    if not points:
-        fig, ax = plt.subplots()
-        ax.text(0.5, 0.5, "No data", ha="center", va="center")
-    else:
-        times = [p["SK"].split("NETWORTH#")[1] for p in points]
-        net_worths = [float(p.get("net_worth", 0.0)) for p in points]
+def render_png(points: list[dict[str, Any]]) -> bytes:
+    import matplotlib
 
-        fig, ax = plt.subplots()
-        ax.plot(times, net_worths, marker="o")
-        ax.set_xlabel("time")
-        ax.set_ylabel("net worth")
-        ax.set_title("Net Worth Over Time")
-        plt.xticks(rotation=45, ha="right")
-        plt.tight_layout()
+    matplotlib.use("Agg")  # no display in Lambda
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read()
+    fig, ax = plt.subplots(figsize=(8, 4), dpi=100)
+    try:
+        if not points:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+        else:
+            times = [timeutil.parse_iso(p["SK"][len(keys.NETWORTH_PREFIX) :]) for p in points]
+            values = [float(p.get("net_worth", 0)) for p in points]
+            ax.plot(times, values, marker="o", markersize=3, linewidth=1.5)
+            ax.set_xlabel("time (UTC)")
+            ax.set_ylabel("net worth")
+            ax.set_title("Managed net worth")
+            ax.grid(alpha=0.3)
+            locator = mdates.AutoDateLocator()
+            ax.xaxis.set_major_locator(locator)
+            ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        fig.tight_layout()
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format="png")
+        return buffer.getvalue()
+    finally:
+        plt.close(fig)
 
 
-def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """
-    Lambda C – Net-Worth Plotter.
-
-    Triggered by API Gateway (proxy=False):
-      - expects queryStringParameters: account_id, start_time, end_time.
-    """
+def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     params = (event or {}).get("queryStringParameters") or {}
-    account_id = params.get("account_id") or _get_account_id()
-    start_time = params.get("start_time", "1970-01-01T00:00:00Z")
-    end_time = params.get("end_time", datetime.utcnow().isoformat() + "Z")
+    account_id = params.get("account_id") or aws.get_account_id()
 
-    points = _query_networth_points(account_id, start_time, end_time)
-    png_bytes = _make_plot(points)
+    start = timeutil.normalize_iso(params.get("start_time")) if params.get("start_time") else None
+    end = timeutil.normalize_iso(params.get("end_time")) if params.get("end_time") else None
+    if params.get("start_time") and start is None:
+        return _response(400, {"error": "start_time must be an ISO-8601 timestamp"})
+    if params.get("end_time") and end is None:
+        return _response(400, {"error": "end_time must be an ISO-8601 timestamp"})
+    start = start or "1970-01-01T00:00:00.000000Z"
+    end = end or timeutil.iso_utc()
+    if start > end:
+        return _response(400, {"error": "start_time must not be after end_time"})
 
-    request_id = str(uuid.uuid4())
-    key = f"plots/networth/{account_id}/{request_id}.png"
+    points = query_points(account_id, start, end)
+    png = render_png(points)
 
-    s3.put_object(
-        Bucket=BUCKET_NAME,
-        Key=key,
-        Body=png_bytes,
-        ContentType="image/png",
+    bucket = aws.require_env("BUCKET_NAME")
+    key = f"plots/networth/{account_id}/{uuid.uuid4()}.png"
+    s3 = aws.client("s3")
+    s3.put_object(Bucket=bucket, Key=key, Body=png, ContentType="image/png")
+    url = s3.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=PRESIGN_SECONDS
     )
-
-    # Generate a presigned URL so the local web app can display the plot directly.
-    presigned_url = s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": BUCKET_NAME, "Key": key},
-        ExpiresIn=3600,
+    return _response(
+        200,
+        {
+            "account_id": account_id,
+            "start_time": start,
+            "end_time": end,
+            "points": len(points),
+            "s3_key": key,
+            "url": url,
+        },
     )
-
-    body = {
-        "account_id": account_id,
-        "start_time": start_time,
-        "end_time": end_time,
-        "s3_key": key,
-        "url": presigned_url,
-    }
-    return {
-        "statusCode": 200,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(body),
-    }
-
-
-

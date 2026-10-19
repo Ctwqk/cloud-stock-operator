@@ -1,542 +1,272 @@
-import json
-import os
-from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Any, Dict, List
+"""Control-plane API (API Gateway REST, Lambda proxy integration).
 
-import boto3
+    POST   /watchlist                      add a stock                         -> 202 {op_id}
+    DELETE /watchlist/{symbol}             soft-delete a stock                 -> 202
+    POST   /watchlist/refresh              fetch prices + news now             -> 202
+    POST   /watchlist/{symbol}/threshold   set the per-stock trade threshold   -> 200
+    POST   /account/cash/adjust            change managed cash                 -> 202 {op_id}
+    POST   /account/shares/adjust          change managed shares of a stock    -> 202 {op_id}
+    POST   /sentiment                      apply an externally computed score  -> 200
+    GET    /operations/{op_id}             outcome of an asynchronous command  -> 200
+
+Two kinds of operations:
+
+* **Commands that move balances** (add stock, cash, shares) are validated here, published to
+  ``ExternalOpsTopic`` and applied by the ``stock_info_writer`` Lambda, the only writer of those
+  fields. They return ``202`` plus an ``op_id``; poll ``GET /operations/{op_id}`` for the result.
+* **Idempotent absolute writes** (threshold, sentiment score) are applied synchronously.
+"""
+
+from __future__ import annotations
+
+import base64
+import logging
+import re
+import uuid
+from collections.abc import Callable
+from typing import Any
+
 from botocore.exceptions import ClientError
 
+from common import aws, ddb, jsonutil, keys, messages, scoring, timeutil
 
-TABLE_NAME = os.environ.get("TABLE_NAME", "")
-EXTERNAL_OPS_TOPIC_ARN = os.environ.get("EXTERNAL_OPS_TOPIC_ARN", "")
-SYSTEM_OPS_TOPIC_ARN = os.environ.get("SYSTEM_OPS_TOPIC_ARN", "")
-NEWS_FETCHER_NAME = os.environ.get("NEWS_FETCHER_NAME", "")
-
-dynamodb = boto3.resource("dynamodb")
-sns = boto3.client("sns")
-sts = boto3.client("sts")
-lambda_client = boto3.client("lambda")
-
-_ACCOUNT_ID_CACHE: str | None = None
+logger = logging.getLogger(__name__)
 
 
-def _get_account_id() -> str:
-    """
-    Resolve AWS account id from STS once per container.
-    """
-    global _ACCOUNT_ID_CACHE
-    if _ACCOUNT_ID_CACHE is None:
-        identity = sts.get_caller_identity()
-        _ACCOUNT_ID_CACHE = identity["Account"]
-    return _ACCOUNT_ID_CACHE
+class ApiError(Exception):
+    def __init__(self, status: int, message: str, **extra: Any) -> None:
+        super().__init__(message)
+        self.status = status
+        self.body = {"error": message, **extra}
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
+def _response(status: int, body: dict[str, Any]) -> dict[str, Any]:
     return {
-        "statusCode": status_code,
+        "statusCode": status,
         "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(body),
+        "body": jsonutil.dumps(body),
     }
 
 
-def _canonical_path(event: Dict[str, Any]) -> str:
-    """
-    Strip API Gateway stage prefix so we can match on logical paths like
-    /watchlist, /account/cash/adjust, etc.
-    """
-    raw_path = event.get("path", "/") or "/"
+def _canonical_path(event: dict[str, Any]) -> str:
+    """Path without a leading stage segment (``/prod/watchlist`` -> ``/watchlist``)."""
+    segments = [s for s in (event.get("path") or "/").split("/") if s]
     stage = (event.get("requestContext") or {}).get("stage")
-
-    segments = raw_path.strip("/").split("/")
     if stage and segments and segments[0] == stage:
         segments = segments[1:]
+    return "/" + "/".join(segments)
 
-    return "/" + "/".join(segments) if segments else "/"
 
-
-def _publish_external(event: Dict[str, Any]) -> None:
-    """
-    Optionally publish a log/audit event to ExternalOpsTopic (SNS → Q1).
-    """
-    if not EXTERNAL_OPS_TOPIC_ARN:
-        return
+def _parse_body(event: dict[str, Any]) -> dict[str, Any]:
+    raw = event.get("body")
+    if not raw:
+        return {}
+    if event.get("isBase64Encoded"):
+        raw = base64.b64decode(raw).decode("utf-8")
     try:
-        # Some fields (e.g., Decimal) are not JSON-serializable by default.
-        # Use default=str so audit events never fail the main flow.
-        payload = json.dumps(event, default=str)
-        sns.publish(TopicArn=EXTERNAL_OPS_TOPIC_ARN, Message=payload)
-    except Exception as exc:  # best-effort logging
-        print(f"Failed to publish external ops event: {exc}")
+        body = jsonutil.loads(raw)
+    except ValueError:
+        raise ApiError(400, "request body must be valid JSON") from None
+    if not isinstance(body, dict):
+        raise ApiError(400, "request body must be a JSON object")
+    return body
 
 
-def _recompute_positions_and_net_worth(account_id: str) -> None:
-    """
-    Recompute positions_value and current_net_worth based on all STOCK# items
-    and the current_cash_managed in SUMMARY.
-    """
-    table = dynamodb.Table(TABLE_NAME)
-    pk = f"ACCOUNT#{account_id}"
-
-    # Query all STOCK# items
-    resp = table.query(
-        KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
-        ExpressionAttributeValues={
-            ":pk": pk,
-            ":sk_prefix": "STOCK#",
-        },
-    )
-    items = resp.get("Items", [])
-
-    positions_value = Decimal("0")
-    for item in items:
-        try:
-            shares_raw = item.get("shares_managed", 0)
-            price_raw = item.get("last_fetched_price", 0)
-            shares = Decimal(str(shares_raw))
-            price = Decimal(str(price_raw))
-            positions_value += shares * price
-        except Exception:
-            continue
-
-    # Read current_cash_managed
-    summary_resp = table.get_item(Key={"PK": pk, "SK": "SUMMARY"})
-    summary = summary_resp.get("Item") or {}
+def _symbol(value: Any) -> str:
     try:
-        cash_raw = summary.get("current_cash_managed", Decimal("0"))
-        cash = cash_raw if isinstance(cash_raw, Decimal) else Decimal(str(cash_raw))
-    except Exception:
-        cash = Decimal("0")
-
-    net_worth = cash + positions_value
-
-    table.update_item(
-        Key={"PK": pk, "SK": "SUMMARY"},
-        UpdateExpression=(
-            "SET positions_value = :pv, current_net_worth = :nw, updated_at = :u"
-        ),
-        ExpressionAttributeValues={
-            ":pv": positions_value,
-            ":nw": net_worth,
-            ":u": _now_iso(),
-        },
-    )
+        return messages.normalize_symbol(value)
+    except ValueError:
+        raise ApiError(400, f"invalid symbol: {value!r}") from None
 
 
-def _handle_add_watchlist(account_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    symbol = str(body.get("symbol", "")).upper()
-    if not symbol:
-        return _response(400, {"error": "symbol is required"})
-
-    shares_managed = int(body.get("shares_managed", 0))
-    now = _now_iso()
-    pk = f"ACCOUNT#{account_id}"
-    sk = f"STOCK#{symbol}"
-
-    table = dynamodb.Table(TABLE_NAME)
-    table.put_item(
-        Item={
-            "PK": pk,
-            "SK": sk,
-            "symbol": symbol,
-            "shares_managed": shares_managed,
-            "current_level_score": 0,
-            "threshold_abs": 1,  # initial threshold is 1
-            "is_deleted": False,
-            "created_at": now,
-            "updated_at": now,
-        }
-    )
-
-    _publish_external(
-        {
-            "type": "ADD_STOCK",
-            "account_id": account_id,
-            "symbol": symbol,
-            "initial_shares_managed": shares_managed,
-        }
-    )
-
-    # Kick off an immediate news fetch so the new stock gets an initial score
-    # from recent history (NewsFetcherLambda will also deduplicate).
-    if NEWS_FETCHER_NAME:
-        try:
-            lambda_client.invoke(
-                FunctionName=NEWS_FETCHER_NAME,
-                InvocationType="Event",
-                Payload=json.dumps({"account_id": account_id}).encode("utf-8"),
-            )
-        except Exception as exc:
-            print(f"Failed to invoke news fetcher for {symbol}: {exc}")
-
-    return _response(200, {"message": "stock added", "symbol": symbol})
+def _require(body: dict[str, Any], *fields: str) -> None:
+    missing = [f for f in fields if f not in body]
+    if missing:
+        raise ApiError(400, f"missing required field(s): {', '.join(missing)}")
 
 
-def _handle_delete_watchlist(account_id: str, symbol: str) -> Dict[str, Any]:
-    symbol = symbol.upper()
-    # Use soft-delete Lambda via SystemOpsTopic → Q2 instead of updating the
-    # item directly here, so all cleanup logic is centralized.
-    if SYSTEM_OPS_TOPIC_ARN:
-        sns.publish(
-            TopicArn=SYSTEM_OPS_TOPIC_ARN,
-            Message=json.dumps(
-                {
-                    "type": "MARK_STOCK_DELETED",
-                    "account_id": account_id,
-                    "symbol": symbol,
-                }
-            ),
-        )
-
-    _publish_external(
-        {
-            "type": "DELETE_STOCK",
-            "account_id": account_id,
-            "symbol": symbol,
-        }
-    )
-
-    return _response(200, {"message": "stock deleted", "symbol": symbol})
-
-
-def _handle_adjust_cash(account_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    if "delta_cash" not in body or "max_allowed_cash" not in body:
-        return _response(
-            400, {"error": "delta_cash and max_allowed_cash are required"}
-        )
-
-    # Convert to Decimal so DynamoDB accepts numeric types
-    delta_cash = Decimal(str(body["delta_cash"]))
-    max_allowed_cash = Decimal(str(body["max_allowed_cash"]))
-
-    pk = f"ACCOUNT#{account_id}"
-    sk = "SUMMARY"
-
-    table = dynamodb.Table(TABLE_NAME)
-
-    # Read current managed cash so we can validate in Python. DynamoDB
-    # condition expressions do not support arithmetic like "+ :delta".
-    resp = table.get_item(Key={"PK": pk, "SK": sk})
-    item = resp.get("Item") or {}
+def _number(body: dict[str, Any], field: str) -> Any:
     try:
-        current_cash = Decimal(str(item.get("current_cash_managed", "0")))
-    except Exception:
-        current_cash = Decimal("0")
-
-    new_cash = current_cash + delta_cash
-    if new_cash > max_allowed_cash:
-        return _response(
-            400,
-            {
-                "error": "managed cash would exceed allowed maximum",
-                "current_cash_managed": str(current_cash),
-                "requested_delta": str(delta_cash),
-                "max_allowed_cash": str(max_allowed_cash),
-            },
-        )
-
-    table.update_item(
-        Key={"PK": pk, "SK": sk},
-        UpdateExpression=(
-            "SET current_cash_managed = :new, updated_at = :u"
-        ),
-        ExpressionAttributeValues={
-            ":new": new_cash,
-            ":u": _now_iso(),
-        },
-    )
-
-    _publish_external(
-        {
-            "type": "ADJUST_MANAGED_CASH",
-            "account_id": account_id,
-            "delta_cash": delta_cash,
-            "max_allowed_cash": max_allowed_cash,
-        }
-    )
-
-    return _response(200, {"message": "cash adjusted"})
+        return ddb.to_decimal(body[field], field)
+    except ValueError as exc:
+        raise ApiError(400, str(exc)) from None
 
 
-def _handle_adjust_shares(account_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    if "symbol" not in body or "delta_shares" not in body or "max_shares_allowed" not in body:
-        return _response(
-            400, {"error": "symbol, delta_shares, max_shares_allowed are required"}
-        )
-
-    symbol = str(body["symbol"]).upper()
-    delta_shares = int(body["delta_shares"])
-    max_shares_allowed = int(body["max_shares_allowed"])
-
-    pk = f"ACCOUNT#{account_id}"
-    sk = f"STOCK#{symbol}"
-
-    table = dynamodb.Table(TABLE_NAME)
-
-    # Read current shares_managed so we can validate in Python.
-    resp = table.get_item(Key={"PK": pk, "SK": sk})
-    item = resp.get("Item") or {}
+def _integer(body: dict[str, Any], field: str) -> int:
     try:
-        current_shares = int(item.get("shares_managed", 0))
-    except (TypeError, ValueError):
-        current_shares = 0
+        return ddb.to_int(body[field], field)
+    except ValueError as exc:
+        raise ApiError(400, str(exc)) from None
 
-    new_shares = current_shares + delta_shares
 
-    if new_shares > max_shares_allowed:
-        return _response(
-            400,
-            {
-                "error": "managed shares would exceed allowed maximum",
-                "symbol": symbol,
-                "current_shares": current_shares,
-                "requested_delta": delta_shares,
-                "max_shares_allowed": max_shares_allowed,
-            },
-        )
-
-    table.update_item(
-        Key={"PK": pk, "SK": sk},
-        UpdateExpression="SET shares_managed = :new, updated_at = :u",
-        ExpressionAttributeValues={
-            ":new": new_shares,
-            ":u": _now_iso(),
-        },
+def _queue_command(account_id: str, command: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    op_id = uuid.uuid4().hex
+    messages.publish(
+        aws.require_env("EXTERNAL_OPS_TOPIC_ARN"),
+        {**command, "op_id": op_id, "account_id": account_id},
     )
+    return 202, {"message": "accepted", "op_id": op_id, "status": "PENDING"}
 
-    # Recompute positions_value and current_net_worth after manual share change.
-    _recompute_positions_and_net_worth(account_id)
 
-    _publish_external(
-        {
-            "type": "ADJUST_MANAGED_SHARES",
-            "account_id": account_id,
-            "symbol": symbol,
-            "delta_shares": delta_shares,
-            "max_shares_allowed": max_shares_allowed,
-        }
+# --- route handlers: (account_id, body, path params) -> (status, body) --------------------
+
+
+def add_watchlist(account_id: str, body: dict[str, Any], params: dict[str, str]):
+    _require(body, "symbol")
+    symbol = _symbol(body["symbol"])
+    shares = _integer(body, "shares_managed") if "shares_managed" in body else 0
+    if shares < 0:
+        raise ApiError(400, "shares_managed must be >= 0")
+    status, payload = _queue_command(
+        account_id,
+        {"type": messages.ADD_STOCK, "symbol": symbol, "initial_shares_managed": shares},
     )
+    return status, {**payload, "symbol": symbol}
 
-    return _response(200, {"message": "shares adjusted", "symbol": symbol})
 
-def _handle_set_threshold(
-    account_id: str, symbol: str, body: Dict[str, Any]
-) -> Dict[str, Any]:
-    if "threshold_abs" not in body:
-        return _response(400, {"error": "threshold_abs is required"})
-
-    threshold_abs = int(body["threshold_abs"])
-    symbol = symbol.upper()
-    pk = f"ACCOUNT#{account_id}"
-    sk = f"STOCK#{symbol}"
-
-    table = dynamodb.Table(TABLE_NAME)
-    table.update_item(
-        Key={"PK": pk, "SK": sk},
-        UpdateExpression="SET threshold_abs = :t, updated_at = :u",
-        ExpressionAttributeValues={
-            ":t": threshold_abs,
-            ":u": _now_iso(),
-        },
+def delete_watchlist(account_id: str, body: dict[str, Any], params: dict[str, str]):
+    symbol = _symbol(params["symbol"])
+    messages.publish(
+        aws.require_env("SYSTEM_OPS_TOPIC_ARN"),
+        {"type": messages.MARK_STOCK_DELETED, "account_id": account_id, "symbol": symbol},
     )
-
-    _publish_external(
-        {
-            "type": "SET_THRESHOLD",
-            "account_id": account_id,
-            "symbol": symbol,
-            "threshold_abs": threshold_abs,
-        }
-    )
-
-    return _response(200, {"message": "threshold updated", "symbol": symbol})
+    return 202, {"message": "delete accepted", "symbol": symbol}
 
 
-def _handle_refresh_watchlist(account_id: str) -> Dict[str, Any]:
-    """
-    Trigger an on-demand refresh for all watchlist entries:
-      - Invokes NewsFetcherLambda asynchronously for this account.
-      - NewsFetcher will update last_fetched_price and publish NEW_NEWS items.
-    """
-    if not NEWS_FETCHER_NAME:
-        return _response(500, {"error": "NEWS_FETCHER_NAME is not configured"})
-
+def refresh_watchlist(account_id: str, body: dict[str, Any], params: dict[str, str]):
+    function_name = aws.require_env("NEWS_FETCHER_NAME")
     try:
-        lambda_client.invoke(
-            FunctionName=NEWS_FETCHER_NAME,
+        aws.client("lambda").invoke(
+            FunctionName=function_name,
             InvocationType="Event",
-            Payload=json.dumps({"account_id": account_id}).encode("utf-8"),
+            Payload=jsonutil.dumps({"account_id": account_id}).encode("utf-8"),
         )
-    except Exception as exc:  # noqa: BLE001
-        print(f"Failed to invoke news fetcher for refresh: {exc}")
-        return _response(500, {"error": f"failed to invoke news fetcher: {exc}"})
-
-    return _response(
-        200,
-        {
-            "message": "watchlist refresh requested; prices/news will update shortly",
-        },
-    )
+    except ClientError:
+        logger.exception("failed to invoke news fetcher")
+        raise ApiError(502, "could not start the refresh") from None
+    return 202, {"message": "refresh requested; prices and news will update shortly"}
 
 
-def _handle_apply_sentiment(account_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Apply a sentiment delta (e.g., from FinBERT running in the local backend).
-
-    Expected body:
-      {
-        "symbol": "AAPL",
-        "delta_score": 1,    # integer delta to add to current_level_score
-        "threshold_abs": 1,  # optional, defaults to 1
-        "reason": "FINBERT"  # optional
-      }
-    """
-    symbol = str(body.get("symbol", "")).upper()
-    if not symbol:
-        return _response(400, {"error": "symbol is required"})
-
-    if "delta_score" not in body:
-        return _response(400, {"error": "delta_score is required"})
-
-    delta_score = int(body["delta_score"])
-    threshold_abs = int(body.get("threshold_abs", 1))
-    reason = str(body.get("reason", "FINBERT"))
-
-    pk = f"ACCOUNT#{account_id}"
-    sk = f"STOCK#{symbol}"
-
-    table = dynamodb.Table(TABLE_NAME)
-
-    # Get current item
-    resp = table.get_item(Key={"PK": pk, "SK": sk})
-    item = resp.get("Item") or {}
-    current_score = int(item.get("current_level_score", 0))
-    existing_threshold = int(item.get("threshold_abs", threshold_abs))
-
-    new_score = current_score + delta_score
-    threshold_abs = existing_threshold or threshold_abs
-
-    # Update item
-    table.update_item(
-        Key={"PK": pk, "SK": sk},
-        UpdateExpression=(
-            "SET current_level_score = :s, "
-            "threshold_abs = :t, "
-            "updated_at = :u"
-        ),
-        ExpressionAttributeValues={
-            ":s": new_score,
-            ":t": threshold_abs,
-            ":u": _now_iso(),
-        },
-    )
-
-    # Record score change history per stock
-    ts = _now_iso()
-    score_sk = f"SCORE#{symbol}#{ts}"
-    table.put_item(
-        Item={
-            "PK": pk,
-            "SK": score_sk,
-            "symbol": symbol,
-            "old_score": current_score,
-            "delta_score": delta_score,
-            "new_score": new_score,
-            "threshold_abs": threshold_abs,
-            "reason": reason,
-            "created_at": ts,
-        }
-    )
-
-    # Threshold checks
-    action: str | None = None
-    if new_score >= threshold_abs:
-        action = "BUY"
-    elif new_score <= -threshold_abs:
-        action = "SELL"
-
-    if action and SYSTEM_OPS_TOPIC_ARN:
-        decision = {
-            "type": "AUTO_TRADE_DECISION",
-            "account_id": account_id,
-            "symbol": symbol,
-            "action": action,
-            "score": new_score,
-            "threshold_abs": threshold_abs,
-            "reason": reason,
-        }
-        sns.publish(TopicArn=SYSTEM_OPS_TOPIC_ARN, Message=json.dumps(decision))
-
-    return _response(
-        200,
-        {
-            "message": "sentiment applied",
-            "symbol": symbol,
-            "new_score": new_score,
-            "threshold_abs": threshold_abs,
-            "action": action,
-        },
-    )
-
-
-def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """
-    Control-plane API Lambda.
-
-    Endpoints (API Gateway Lambda proxy integration):
-      - POST   /watchlist                 -> add stock to watchlist
-      - DELETE /watchlist/{symbol}        -> soft-delete stock
-      - POST   /account/cash/adjust       -> adjust current_cash_managed
-      - POST   /account/shares/adjust     -> adjust shares_managed per symbol
-      - POST   /watchlist/{symbol}/threshold -> set/update per-stock threshold
-    """
-    method = event.get("httpMethod", "")
-    path = _canonical_path(event)
-
+def set_threshold(account_id: str, body: dict[str, Any], params: dict[str, str]):
+    _require(body, "threshold_abs")
+    symbol = _symbol(params["symbol"])
+    threshold = _integer(body, "threshold_abs")
+    if threshold < 1:
+        raise ApiError(400, "threshold_abs must be >= 1")
     try:
-        body = json.loads(event.get("body") or "{}")
-    except Exception:
-        body = {}
+        aws.table().update_item(
+            Key={"PK": keys.account_pk(account_id), "SK": keys.stock_sk(symbol)},
+            UpdateExpression="SET threshold_abs = :t, updated_at = :u",
+            ConditionExpression="attribute_exists(PK)",
+            ExpressionAttributeValues={":t": threshold, ":u": timeutil.iso_utc()},
+        )
+    except ClientError as exc:
+        if ddb.is_conditional_failure(exc):
+            raise ApiError(404, f"{symbol} is not on the watchlist") from None
+        raise
+    return 200, {"message": "threshold updated", "symbol": symbol, "threshold_abs": threshold}
 
-    account_id = _get_account_id()
 
-    if method == "POST" and path == "/watchlist":
-        return _handle_add_watchlist(account_id, body)
-
-    if method == "DELETE" and path.startswith("/watchlist/"):
-        parts: List[str] = path.strip("/").split("/")
-        symbol = parts[-1] if len(parts) >= 2 else ""
-        return _handle_delete_watchlist(account_id, symbol)
-
-    if method == "POST" and path == "/account/cash/adjust":
-        return _handle_adjust_cash(account_id, body)
-
-    if method == "POST" and path == "/account/shares/adjust":
-        return _handle_adjust_shares(account_id, body)
-
-    if method == "POST" and path.startswith("/watchlist/") and path.endswith(
-        "/threshold"
-    ):
-        # /watchlist/{symbol}/threshold
-        parts = path.strip("/").split("/")
-        if len(parts) >= 3:
-            symbol = parts[1]
-            return _handle_set_threshold(account_id, symbol, body)
-
-    if method == "POST" and path == "/watchlist/refresh":
-        return _handle_refresh_watchlist(account_id)
-
-    if method == "POST" and path == "/sentiment":
-        # Local backend (FinBERT) posts sentiment delta here.
-        return _handle_apply_sentiment(account_id, body)
-
-    return _response(
-        404, {"error": f"Unhandled method/path: {method} {path}"}
+def adjust_cash(account_id: str, body: dict[str, Any], params: dict[str, str]):
+    _require(body, "delta_cash", "max_allowed_cash")
+    status, payload = _queue_command(
+        account_id,
+        {
+            "type": messages.ADJUST_MANAGED_CASH,
+            "delta_cash": _number(body, "delta_cash"),
+            "max_allowed_cash": _number(body, "max_allowed_cash"),
+        },
     )
+    return status, payload
 
 
+def adjust_shares(account_id: str, body: dict[str, Any], params: dict[str, str]):
+    _require(body, "symbol", "delta_shares", "max_shares_allowed")
+    status, payload = _queue_command(
+        account_id,
+        {
+            "type": messages.ADJUST_MANAGED_SHARES,
+            "symbol": _symbol(body["symbol"]),
+            "delta_shares": _integer(body, "delta_shares"),
+            "max_shares_allowed": _integer(body, "max_shares_allowed"),
+        },
+    )
+    return status, payload
 
+
+def apply_sentiment(account_id: str, body: dict[str, Any], params: dict[str, str]):
+    """An external scorer (e.g. a local FinBERT process) posts a delta for one stock."""
+    _require(body, "symbol", "delta_score")
+    symbol = _symbol(body["symbol"])
+    delta = _integer(body, "delta_score")
+    if not -10 <= delta <= 10:
+        raise ApiError(400, "delta_score must be between -10 and 10")
+    result = scoring.apply_sentiment(
+        account_id=account_id,
+        symbol=symbol,
+        delta=delta,
+        reason=str(body.get("reason", "EXTERNAL"))[:50],
+        # Callers that may retry should pass a stable event_id to make the call idempotent.
+        dedupe_id=f"api:{body.get('event_id') or uuid.uuid4().hex}",
+        topic_arn=aws.require_env("SYSTEM_OPS_TOPIC_ARN"),
+        headline=str(body.get("headline", "")),
+    )
+    if result.status == "unknown_symbol":
+        raise ApiError(404, f"{symbol} is not on the watchlist")
+    return 200, {
+        "message": "sentiment applied" if result.status == "applied" else "duplicate ignored",
+        "symbol": symbol,
+        "new_score": result.score,
+        "threshold_abs": result.threshold_abs,
+        "action": result.action,
+    }
+
+
+def get_operation(account_id: str, body: dict[str, Any], params: dict[str, str]):
+    op_id = params["op_id"]
+    item = (
+        aws.table()
+        .get_item(
+            Key={"PK": keys.account_pk(account_id), "SK": keys.op_sk(op_id)}, ConsistentRead=True
+        )
+        .get("Item")
+    )
+    if not item:
+        # Not applied (yet): still queued, or unknown / expired.
+        return 200, {"op_id": op_id, "status": "PENDING"}
+    return 200, {
+        "op_id": op_id,
+        "status": item.get("status"),
+        "type": item.get("type"),
+        "reason": item.get("reason"),
+    }
+
+
+Route = tuple[str, "re.Pattern[str]", Callable[..., tuple[int, dict[str, Any]]]]
+ROUTES: list[Route] = [
+    ("POST", re.compile(r"^/watchlist$"), add_watchlist),
+    ("POST", re.compile(r"^/watchlist/refresh$"), refresh_watchlist),
+    ("DELETE", re.compile(r"^/watchlist/(?P<symbol>[^/]+)$"), delete_watchlist),
+    ("POST", re.compile(r"^/watchlist/(?P<symbol>[^/]+)/threshold$"), set_threshold),
+    ("POST", re.compile(r"^/account/cash/adjust$"), adjust_cash),
+    ("POST", re.compile(r"^/account/shares/adjust$"), adjust_shares),
+    ("POST", re.compile(r"^/sentiment$"), apply_sentiment),
+    ("GET", re.compile(r"^/operations/(?P<op_id>[A-Za-z0-9_\-]+)$"), get_operation),
+]
+
+
+def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
+    method = (event.get("httpMethod") or "").upper()
+    path = _canonical_path(event)
+    try:
+        for route_method, pattern, func in ROUTES:
+            match = pattern.match(path)
+            if match and route_method == method:
+                status, payload = func(aws.get_account_id(), _parse_body(event), match.groupdict())
+                return _response(status, payload)
+        raise ApiError(404, f"no route for {method} {path}")
+    except ApiError as err:
+        return _response(err.status, err.body)
+    except Exception:
+        logger.exception("unhandled error for %s %s", method, path)
+        return _response(500, {"error": "internal error"})

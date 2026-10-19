@@ -1,0 +1,2 @@
+# Lambda layer for lambda/networth_plotter
+matplotlib>=3.8

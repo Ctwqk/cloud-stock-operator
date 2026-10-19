@@ -1,0 +1,2 @@
+# Lambda layer for lambda/sentiment_scorer (pure Python, ~0.5 MB)
+vaderSentiment>=3.3.2

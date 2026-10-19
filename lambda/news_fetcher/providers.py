@@ -3,12 +3,15 @@
 ``yfinance`` (default) is the real source. ``fixture`` serves canned headlines and prices from a
 JSON file, which is what the local demo and the tests use: it is deterministic and works offline.
 Select with ``NEWS_PROVIDER=yfinance|fixture`` (``NEWS_FIXTURE_PATH`` for the file).
+``NEWS_FIXTURE_DRIFT=1`` makes fixture prices move deterministically with the clock (a slow
++/-2 % sine per symbol) so that the local demo's net-worth chart is not a flat line.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,7 +19,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
-from common import timeutil
+from common import messages, timeutil
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +122,11 @@ class YFinanceProvider:
 class FixtureProvider:
     """Canned data: ``{"prices": {"AAPL": 195.2}, "news": {"AAPL": [{headline, body, ...}]}}``."""
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    DRIFT_AMPLITUDE = 0.02
+    DRIFT_PERIOD_S = 600.0
+
+    def __init__(self, path: str | os.PathLike[str], drift: bool = False) -> None:
+        self._drift = drift
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         self._prices: dict[str, Any] = data.get("prices", {})
         self._news: dict[str, list[dict[str, Any]]] = data.get("news", {})
@@ -139,8 +146,17 @@ class FixtureProvider:
         return items
 
     def last_price(self, symbol: str) -> Decimal | None:
-        price = self._prices.get(symbol.upper())
-        return Decimal(str(price)) if price is not None else None
+        base = self._prices.get(symbol.upper())
+        if base is None:
+            return None
+        price = Decimal(str(base))
+        if self._drift:
+            phase = int(messages.stable_id(symbol.upper(), length=6), 16) % 628 / 100
+            angle = 2 * math.pi * timeutil.now().timestamp() / self.DRIFT_PERIOD_S + phase
+            price = (price * Decimal(str(1 + self.DRIFT_AMPLITUDE * math.sin(angle)))).quantize(
+                Decimal("0.01")
+            )
+        return price
 
 
 def get_provider() -> NewsProvider:
@@ -149,7 +165,7 @@ def get_provider() -> NewsProvider:
         path = os.environ.get("NEWS_FIXTURE_PATH")
         if not path:
             raise ProviderUnavailable("NEWS_PROVIDER=fixture requires NEWS_FIXTURE_PATH")
-        return FixtureProvider(path)
+        return FixtureProvider(path, drift=os.environ.get("NEWS_FIXTURE_DRIFT") == "1")
     if name == "yfinance":
         return YFinanceProvider()
     raise ProviderUnavailable(f"unknown NEWS_PROVIDER {name!r}")

@@ -1,0 +1,88 @@
+{
+  "_comment": "Canned prices and headlines for the offline demo (NEWS_PROVIDER=fixture). Fictional-style items written for this project; not real market data.",
+  "prices": {
+    "AAPL": 232.45,
+    "MSFT": 478.10,
+    "TSLA": 341.75,
+    "NVDA": 176.30,
+    "AMZN": 224.60
+  },
+  "news": {
+    "AAPL": [
+      {
+        "headline": "Apple beats earnings estimates as iPhone sales surge",
+        "body": "Quarterly revenue topped forecasts and the company raised its guidance for the holiday period.",
+        "source": "fixture-wire",
+        "published_at": "2025-12-01T14:05:00Z"
+      },
+      {
+        "headline": "Apple announces new retail store opening in Singapore",
+        "body": "The store will open next spring.",
+        "source": "fixture-wire",
+        "published_at": "2025-12-02T09:30:00Z"
+      },
+      {
+        "headline": "Analyst upgrades Apple to outperform on services growth",
+        "body": "The brokerage cited strong subscription momentum and record margins.",
+        "source": "fixture-research",
+        "published_at": "2025-12-03T11:00:00Z"
+      }
+    ],
+    "MSFT": [
+      {
+        "headline": "Microsoft shares rally after cloud revenue accelerates",
+        "body": "Azure growth beat expectations and the company announced a larger buyback.",
+        "source": "fixture-wire",
+        "published_at": "2025-12-01T16:20:00Z"
+      },
+      {
+        "headline": "Microsoft hit by antitrust probe over cloud licensing",
+        "body": "Regulators opened an investigation into licensing practices.",
+        "source": "fixture-wire",
+        "published_at": "2025-12-02T13:45:00Z"
+      }
+    ],
+    "TSLA": [
+      {
+        "headline": "Tesla recalls 200,000 vehicles amid safety probe",
+        "body": "Regulators opened an investigation after reports of braking failures.",
+        "source": "fixture-wire",
+        "published_at": "2025-12-01T10:10:00Z"
+      },
+      {
+        "headline": "Tesla shares tumble after analyst downgrade",
+        "body": "Concerns about slowing demand and weak margins weigh on the stock.",
+        "source": "fixture-research",
+        "published_at": "2025-12-02T15:00:00Z"
+      },
+      {
+        "headline": "Tesla reports quarterly deliveries",
+        "body": "Deliveries were in line with the company's published figures.",
+        "source": "fixture-wire",
+        "published_at": "2025-12-03T08:00:00Z"
+      }
+    ],
+    "NVDA": [
+      {
+        "headline": "Nvidia surges to record high on strong data center demand",
+        "body": "Analysts raised price targets after a breakthrough product launch.",
+        "source": "fixture-wire",
+        "published_at": "2025-12-01T18:30:00Z"
+      },
+      {
+        "headline": "Nvidia plunges as export restrictions threaten sales",
+        "body": "A warning about lost revenue triggered a sell-off in chip stocks.",
+        "source": "fixture-wire",
+        "published_at": "2025-12-03T17:15:00Z"
+      }
+    ],
+    "AMZN": [
+      {
+        "headline": "Amazon expands same-day delivery to 20 more cities",
+        "body": "",
+        "source": "fixture-wire",
+        "published_at": "2025-12-02T12:00:00Z"
+      }
+    ]
+  }
+}

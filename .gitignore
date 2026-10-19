@@ -36,3 +36,9 @@ layers/build/
 *.zip
 
 
+
+# Test / coverage output
+.coverage
+htmlcov/
+.ruff_cache/
+node_modules/

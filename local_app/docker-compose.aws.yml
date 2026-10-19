@@ -1,0 +1,32 @@
+# Run the web UI and the trade worker against a DEPLOYED stack (real AWS).
+# Use through local_app/run_against_aws.sh, which fills the environment from the stack outputs.
+name: cloud-stock-operator-aws
+
+x-app: &app
+  image: ${LOCAL_IMAGE:-cloud-stock-operator-local}
+  build:
+    context: ..
+    dockerfile: local_app/Dockerfile
+  restart: unless-stopped
+  environment: &env
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:?set AWS_DEFAULT_REGION}
+    AWS_PROFILE: ${AWS_PROFILE:-default}
+    TABLE_NAME: ${TABLE_NAME:-TradingTable}
+    BUCKET_NAME: ${BUCKET_NAME:?set BUCKET_NAME}
+    MGMT_API_BASE_URL: ${MGMT_API_BASE_URL:?set MGMT_API_BASE_URL}
+    NETWORTH_API_BASE_URL: ${NETWORTH_API_BASE_URL:?set NETWORTH_API_BASE_URL}
+    MGMT_API_KEY: ${MGMT_API_KEY:-}
+    TRADE_DECISION_QUEUE_URL: ${TRADE_DECISION_QUEUE_URL:?set TRADE_DECISION_QUEUE_URL}
+  volumes:
+    # credentials for boto3 (read-only); the container needs DynamoDB/S3/SQS access
+    - ${HOME}/.aws:/home/app/.aws:ro
+
+services:
+  worker:
+    <<: *app
+    command: ["python", "local_app/local_trade_worker.py"]
+  web:
+    <<: *app
+    command: ["python", "local_app/web_app.py"]
+    ports:
+      - "${WEB_PORT:-9090}:9090"

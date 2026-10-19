@@ -1,23 +1,75 @@
+# Local, offline demo of the whole system (no AWS account needed).
+#
+#   docker compose -f local_app/docker-compose.yml up --build
+#   open http://localhost:9090
+#
+# cloud   moto (DynamoDB/S3/SNS/SQS/STS) + the Lambda handlers + EventBridge schedules +
+#         an API Gateway stand-in, all driven by the same topology as the CDK stack
+# seed    one-shot: adds cash and a few stocks through the public API, then exits
+# worker  the local trade worker (polls TradeDecisionQueue, executes virtual trades)
+# web     the control panel
+name: cloud-stock-operator
+
+x-app: &app
+  image: ${LOCAL_IMAGE:-cloud-stock-operator-local}
+  build:
+    context: ..
+    dockerfile: local_app/Dockerfile
+  restart: unless-stopped
+
+x-client-env: &client-env
+  AWS_ACCESS_KEY_ID: local
+  AWS_SECRET_ACCESS_KEY: local
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ENDPOINT_URL: http://cloud:5000
+  TABLE_NAME: TradingTable
+  BUCKET_NAME: cloud-stock-local
+  MGMT_API_BASE_URL: http://cloud:8000/mgmt
+  NETWORTH_API_BASE_URL: http://cloud:8000
+  MGMT_API_KEY: local-demo-key
+
 services:
-  trading-app:
-    build: .
-    image: trading-local
-    ports:
-      - "9090:9090"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+  cloud:
+    <<: *app
+    command: ["python", "local_app/local_cloud.py"]
     environment:
-      - AWS_REGION
-      - AWS_DEFAULT_REGION
-      - TABLE_NAME
-      - SYSTEM_OPS_QUEUE_URL
-      - MGMT_API_BASE_URL
-      - NETWORTH_API_BASE_URL
-      - IB_GATEWAY_HOST
-      - IB_GATEWAY_PORT
-      - IB_CLIENT_ID
-      # If you use a named profile other than 'default', uncomment and set this:
-      # - AWS_PROFILE=default
-    volumes:
-      # Mount local AWS credentials so boto3 inside container can authenticate
-      - ~/.aws:/root/.aws:ro
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: us-east-1
+      LOCAL_API_KEY: local-demo-key
+      NEWS_PROVIDER: fixture
+      NEWS_FIXTURE_DRIFT: "1"        # small deterministic price movement so the plot is not flat
+      FETCH_INTERVAL_S: "30"
+      SNAPSHOT_INTERVAL_S: "20"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/_local/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  seed:
+    <<: *app
+    restart: "no"
+    command: ["python", "local_app/demo_seed.py"]
+    environment: *client-env
+    depends_on:
+      cloud:
+        condition: service_healthy
+
+  worker:
+    <<: *app
+    command: ["python", "local_app/local_trade_worker.py"]
+    environment: *client-env
+    depends_on:
+      cloud:
+        condition: service_healthy
+
+  web:
+    <<: *app
+    command: ["python", "local_app/web_app.py"]
+    environment: *client-env
+    ports:
+      - "${WEB_PORT:-9090}:9090"
+    depends_on:
+      cloud:
+        condition: service_healthy

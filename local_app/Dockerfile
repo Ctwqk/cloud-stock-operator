@@ -1,20 +1,26 @@
+# Image for the local demo (cloud emulator, trade worker, web UI). Build context: repo root.
 FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    PATH="/app/.venv/bin:$PATH" \
+    PYTHONPATH=/app/lambda:/app/local_app
+
+RUN pip install --no-cache-dir uv
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+# Dependencies first (cached layer): exactly the locked 'local' group, nothing else.
+COPY pyproject.toml uv.lock .python-version ./
+RUN uv sync --frozen --no-dev --only-group local --no-install-project
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+COPY lambda ./lambda
+COPY local_app ./local_app
 
-COPY . /app
+RUN useradd --create-home app && chown -R app:app /app
+USER app
 
 EXPOSE 9090
-
-CMD ["bash", "-lc", "python local_trade_worker.py & python web_app.py"]
-
-
-
-
+CMD ["python", "local_app/web_app.py"]

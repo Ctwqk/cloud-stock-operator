@@ -1,404 +1,295 @@
+"""Local trade worker: the "outside AWS" consumer of trade decisions.
+
+It polls ``TradeDecisionQueue`` for ``AUTO_TRADE_DECISION`` messages (published by the sentiment
+scorer when a stock's score crosses its threshold) and executes them as **virtual trades**
+against the managed cash / shares stored in DynamoDB. No broker is involved: the earlier IBKR
+integration was removed, so this is paper trading at the last fetched price.
+
+Every decision is executed atomically (one DynamoDB transaction updates cash, shares, the trade
+log and a ``DECISION#<id>`` marker), which makes the worker safe against redelivery: executing
+the same decision twice is a no-op. Rejected decisions (no price, not enough cash/shares...)
+are logged as ``TRADE#`` items with a ``REJECTED_*`` status.
+
+Configuration (environment)::
+
+    TABLE_NAME                 DynamoDB table (default: TradingTable)
+    TRADE_DECISION_QUEUE_URL   queue to poll; or
+    TRADE_DECISION_QUEUE_NAME  queue name to resolve (default: TradeDecisionQueue)
+    TRADE_QUANTITY             shares per decision when the message has no "shares" (default: 1)
+    AWS_ENDPOINT_URL           point at the local emulator instead of AWS
 """
-Local Trade Worker
-===================
 
-Runs on your IBKR Gateway machine (laptop/desktop), NEVER in AWS.
+from __future__ import annotations
 
-Responsibilities:
-  - Poll SQS Q2 (SystemOpsQueue) for AUTO_TRADE_DECISION messages.
-  - For each decision, place trades via IBKR Gateway on localhost:4001/4002.
-  - Poll NEWS_STORED messages and run FinBERT (or any sentiment model) locally,
-    then POST the sentiment delta back to AWS Management API, which applies it
-    to DynamoDB and emits AUTO_TRADE_DECISION if thresholds are crossed.
-  - Optionally write trade status back to DynamoDB (TRADE#... items).
-
-This script is intentionally minimal and does NOT contain real IBKR code.
-You should plug in your existing IBKR integration where indicated.
-"""
-
-import json
+import logging
 import os
+import signal
+import sys
 import time
-from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any
 
-import boto3
-import requests
+from botocore.exceptions import ClientError
 
+from common import aws, ddb, keys, messages, portfolio, timeutil
 
-# Configure these via environment variables or edit directly.
-SYSTEM_OPS_QUEUE_URL = os.environ.get(
-    "SYSTEM_OPS_QUEUE_URL",
-    "https://sqs.<region>.amazonaws.com/<account-id>/SystemOpsQueue",
-)
-TABLE_NAME = os.environ.get("TABLE_NAME", "TradingTable")
-MGMT_API_BASE_URL = os.environ.get("MGMT_API_BASE_URL", "").rstrip("/")
+logger = logging.getLogger("local_trade_worker")
 
-sqs = boto3.client("sqs")
-dynamodb = boto3.resource("dynamodb")
-s3 = boto3.client("s3")
+DECISION_TTL_DAYS = 45
 
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+EXECUTED = "EXECUTED_VIRTUAL"
+REJECTED_NO_PRICE = "REJECTED_NO_PRICE"
+REJECTED_CASH = "REJECTED_INSUFFICIENT_MANAGED_CASH"
+REJECTED_SHARES = "REJECTED_INSUFFICIENT_SHARES"
+REJECTED_SYMBOL = "REJECTED_UNKNOWN_SYMBOL"
+REJECTED_ACTION = "REJECTED_BAD_ACTION"
+DUPLICATE = "DUPLICATE"
 
 
-def _run_finbert_on_text(headline: str, body: str) -> int:
-    """
-    Placeholder for real FinBERT scoring.
-    Return an integer delta in {-1, 0, +1} based on sentiment.
-    Replace this with your actual FinBERT code.
-    """
-    # TODO: integrate real FinBERT model here. For now, always return +1.
-    return 1
+def _stock_condition() -> str:
+    return "attribute_exists(PK) AND (attribute_not_exists(is_deleted) OR is_deleted = :false)"
 
 
-_ib: Optional[object] = None  # kept only to avoid breaking references if any
+def execute_decision(msg: dict[str, Any]) -> str:
+    """Execute one ``AUTO_TRADE_DECISION``. Returns the resulting status string."""
+    if msg.get("type") != messages.AUTO_TRADE_DECISION:
+        raise ValueError(f"unexpected message type {msg.get('type')!r}")
 
+    account_id = str(msg["account_id"])
+    symbol = messages.normalize_symbol(msg["symbol"])
+    action = str(msg["action"]).upper()
+    quantity = int(msg.get("shares") or os.environ.get("TRADE_QUANTITY", "1"))
+    decision_id = str(msg.get("decision_id") or f"adhoc-{timeutil.iso_utc()}")
+    if quantity < 1:
+        raise ValueError("shares must be >= 1")
 
-def _get_managed_cash(account_id: str) -> float:
-    """
-    Read current_cash_managed from the SUMMARY item for the account.
-    """
-    table = dynamodb.Table(TABLE_NAME)
-    resp = table.get_item(Key={"PK": f"ACCOUNT#{account_id}", "SK": "SUMMARY"})
-    item = resp.get("Item") or {}
-    value = item.get("current_cash_managed", 0)
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+    table = aws.table()
+    pk = keys.account_pk(account_id)
+    stock_key = {"PK": pk, "SK": keys.stock_sk(symbol)}
+    summary_key = {"PK": pk, "SK": keys.SUMMARY_SK}
 
-
-def _update_managed_cash(account_id: str, new_cash: float) -> None:
-    """
-    Persist a new current_cash_managed value to the SUMMARY item.
-    """
-    table = dynamodb.Table(TABLE_NAME)
-    table.update_item(
-        Key={"PK": f"ACCOUNT#{account_id}", "SK": "SUMMARY"},
-        UpdateExpression="SET current_cash_managed = :c, updated_at = :u",
-        ExpressionAttributeValues={
-            ":c": Decimal(str(new_cash)),
-            ":u": _now_iso(),
-        },
+    stock = table.get_item(Key=stock_key, ConsistentRead=True).get("Item")
+    price = (
+        ddb.to_decimal(stock["last_fetched_price"])
+        if stock and stock.get("last_fetched_price")
+        else None
     )
 
+    if action not in {"BUY", "SELL"}:
+        return _record(msg, decision_id, REJECTED_ACTION, quantity, price)
+    if not stock or stock.get("is_deleted"):
+        return _record(msg, decision_id, REJECTED_SYMBOL, quantity, price)
+    if price is None or price <= 0:
+        return _record(msg, decision_id, REJECTED_NO_PRICE, quantity, price)
 
-def _get_last_fetched_price(account_id: str, symbol: str) -> Optional[float]:
-    """
-    Load last_fetched_price from the STOCK item, if present.
+    notional = price * quantity
+    now = timeutil.iso_utc()
+    table_name = table.name
+    if action == "BUY":
+        money = {
+            "Key": summary_key,
+            "UpdateExpression": (
+                "SET current_cash_managed = current_cash_managed - :n, updated_at = :now"
+            ),
+            "ConditionExpression": (
+                "attribute_exists(current_cash_managed) AND current_cash_managed >= :n"
+            ),
+            "ExpressionAttributeValues": {":n": notional, ":now": now},
+        }
+        position = {
+            "Key": stock_key,
+            "UpdateExpression": (
+                "SET shares_managed = if_not_exists(shares_managed, :zero) + :q, updated_at = :now"
+            ),
+            "ConditionExpression": _stock_condition(),
+            "ExpressionAttributeValues": {":q": quantity, ":zero": 0, ":false": False, ":now": now},
+        }
+        failure_status = REJECTED_CASH
+    else:
+        money = {
+            "Key": summary_key,
+            "UpdateExpression": (
+                "SET current_cash_managed = if_not_exists(current_cash_managed, :zero) + :n, "
+                "updated_at = :now"
+            ),
+            "ExpressionAttributeValues": {":n": notional, ":zero": Decimal("0"), ":now": now},
+        }
+        position = {
+            "Key": stock_key,
+            "UpdateExpression": "SET shares_managed = shares_managed - :q, updated_at = :now",
+            "ConditionExpression": (
+                "attribute_exists(PK) AND shares_managed >= :q "
+                "AND (attribute_not_exists(is_deleted) OR is_deleted = :false)"
+            ),
+            "ExpressionAttributeValues": {":q": quantity, ":false": False, ":now": now},
+        }
+        failure_status = REJECTED_SHARES
 
-    This is written by the NewsFetcher Lambda using yfinance.
-    """
-    table = dynamodb.Table(TABLE_NAME)
-    resp = table.get_item(
-        Key={"PK": f"ACCOUNT#{account_id}", "SK": f"STOCK#{symbol}"}
-    )
-    item = resp.get("Item") or {}
-    value = item.get("last_fetched_price")
-    if value is None:
-        return None
+    marker = _decision_marker(pk, decision_id, EXECUTED)
+    trade = _trade_item(msg, decision_id, EXECUTED, quantity, price, now)
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+        aws.ddb_client().transact_write_items(
+            TransactItems=[
+                {
+                    "Put": {
+                        "TableName": table_name,
+                        "Item": marker,
+                        "ConditionExpression": "attribute_not_exists(PK)",
+                    }
+                },
+                {"Update": {"TableName": table_name, **money}},
+                {"Update": {"TableName": table_name, **position}},
+                {"Put": {"TableName": table_name, "Item": trade}},
+            ]
+        )
+    except ClientError as exc:
+        codes = ddb.cancellation_codes(exc)
+        if codes[:1] == ["ConditionalCheckFailed"]:
+            logger.info("decision %s already handled", decision_id)
+            return DUPLICATE
+        if "ConditionalCheckFailed" in codes[1:3]:
+            return _record(msg, decision_id, failure_status, quantity, price)
+        raise
+
+    portfolio.refresh_summary(account_id)
+    logger.info("%s %s x%s @ %s -> %s", action, symbol, quantity, price, EXECUTED)
+    return EXECUTED
 
 
-def _recompute_positions_and_net_worth(account_id: str) -> None:
-    """
-    Recompute positions_value and current_net_worth for the account based on
-    all STOCK# items and current_cash_managed.
-    """
-    table = dynamodb.Table(TABLE_NAME)
-    pk = f"ACCOUNT#{account_id}"
-
-    # Query all STOCK# items for this account
-    resp = table.query(
-        KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
-        ExpressionAttributeValues={
-            ":pk": pk,
-            ":sk_prefix": "STOCK#",
-        },
-    )
-    items = resp.get("Items", [])
-
-    positions_value = 0.0
-    for item in items:
-        try:
-            shares = float(item.get("shares_managed", 0) or 0)
-            price = float(item.get("last_fetched_price", 0) or 0)
-            positions_value += shares * price
-        except (TypeError, ValueError):
-            continue
-
-    # Read current_cash_managed
-    summary_resp = table.get_item(Key={"PK": pk, "SK": "SUMMARY"})
-    summary = summary_resp.get("Item") or {}
-    try:
-        cash = float(summary.get("current_cash_managed", 0) or 0)
-    except (TypeError, ValueError):
-        cash = 0.0
-
-    net_worth = cash + positions_value
-
-    table.update_item(
-        Key={"PK": pk, "SK": "SUMMARY"},
-        UpdateExpression=(
-            "SET positions_value = :pv, current_net_worth = :nw, updated_at = :u"
-        ),
-        ExpressionAttributeValues={
-            ":pv": Decimal(str(positions_value)),
-            ":nw": Decimal(str(net_worth)),
-            ":u": _now_iso(),
-        },
-    )
-
-
-def _ib_self_test() -> None:
-    """
-    IBKR is no longer used for placing real orders; this self-test is now a no-op.
-    Kept for backwards compatibility with the startup flow.
-    """
-    print(f"[{_now_iso()}] IBKR trading disabled; running in pseudo-trading mode.")
-
-
-def _handle_news_stored(msg: Dict[str, Any]) -> None:
-    """
-    Handle NEWS_STORED message:
-      {
-        \"type\": \"NEWS_STORED\",
-        \"account_id\": \"...\",
-        \"symbol\": \"AAPL\",
-        \"bucket\": \"...\",
-        \"key\": \"news/AAPL/2025-01-01/....json\"
-      }
-    """
-    if not MGMT_API_BASE_URL:
-        print("MGMT_API_BASE_URL not set; skipping FinBERT sentiment apply.")
-        return
-
-    account_id = msg.get("account_id")
-    symbol = msg.get("symbol")
-    bucket = msg.get("bucket")
-    key = msg.get("key")
-
-    if not (account_id and symbol and bucket and key):
-        print("NEWS_STORED message missing required fields, skipping:", msg)
-        return
-
-    # Load news content from S3
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        body_str = obj["Body"].read().decode("utf-8")
-        news = json.loads(body_str)
-    except Exception as exc:
-        print(f"Failed to load news object {bucket}/{key}: {exc}")
-        return
-
-    headline = news.get("headline", "")
-    body_text = news.get("body", "")
-
-    delta = _run_finbert_on_text(headline, body_text)
-
-    payload = {
-        "symbol": symbol,
-        "delta_score": delta,
-        "reason": "FINBERT",
+def _decision_marker(pk: str, decision_id: str, status: str) -> dict[str, Any]:
+    return {
+        "PK": pk,
+        "SK": keys.decision_sk(decision_id),
+        "status": status,
+        "created_at": timeutil.iso_utc(),
+        keys.TTL_ATTRIBUTE: timeutil.epoch_in(days=DECISION_TTL_DAYS),
     }
 
-    url = f"{MGMT_API_BASE_URL}/sentiment"
+
+def _trade_item(
+    msg: dict[str, Any],
+    decision_id: str,
+    status: str,
+    quantity: int,
+    price: Decimal | None,
+    created_at: str,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "PK": keys.account_pk(str(msg["account_id"])),
+        "SK": keys.trade_sk(created_at, decision_id),
+        "decision_id": decision_id,
+        "symbol": str(msg.get("symbol", "")).upper(),
+        "side": str(msg.get("action", "")).upper(),
+        "reason": msg.get("reason", "SCORE_THRESHOLD"),
+        "status": status,
+        "quantity": quantity,
+        "created_at": created_at,
+    }
+    if msg.get("score") is not None:
+        item["score"] = msg["score"]
+        item["threshold_abs"] = msg.get("threshold_abs")
+    if price is not None:
+        item["last_price"] = price
+        item["notional"] = price * quantity
+    return item
+
+
+def _record(
+    msg: dict[str, Any], decision_id: str, status: str, quantity: int, price: Decimal | None
+) -> str:
+    """Log a rejected decision (and mark it handled) in one transaction."""
+    table_name = aws.table().name
+    now = timeutil.iso_utc()
+    pk = keys.account_pk(str(msg["account_id"]))
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        print(
-            f"[{_now_iso()}] Sentiment applied via {url}: {resp.status_code} {resp.text}"
+        aws.ddb_client().transact_write_items(
+            TransactItems=[
+                {
+                    "Put": {
+                        "TableName": table_name,
+                        "Item": _decision_marker(pk, decision_id, status),
+                        "ConditionExpression": "attribute_not_exists(PK)",
+                    }
+                },
+                {
+                    "Put": {
+                        "TableName": table_name,
+                        "Item": _trade_item(msg, decision_id, status, quantity, price, now),
+                    }
+                },
+            ]
         )
-    except Exception as exc:
-        print(f"Error posting sentiment to {url}: {exc}")
+    except ClientError as exc:
+        if ddb.cancellation_codes(exc)[:1] == ["ConditionalCheckFailed"]:
+            return DUPLICATE
+        raise
+    logger.warning("decision %s rejected: %s", decision_id, status)
+    return status
 
 
-def _handle_auto_trade_decision(msg: Dict[str, Any]) -> None:
-    """
-    Handle a single AUTO_TRADE_DECISION message.
+# --------------------------------------------------------------------------------------------
+# Queue loop
+# --------------------------------------------------------------------------------------------
+def queue_url() -> str:
+    explicit = os.environ.get("TRADE_DECISION_QUEUE_URL")
+    if explicit:
+        return explicit
+    name = os.environ.get("TRADE_DECISION_QUEUE_NAME", "TradeDecisionQueue")
+    return aws.client("sqs").get_queue_url(QueueName=name)["QueueUrl"]
 
-    Expected shape:
-      {
-        \"type\": \"AUTO_TRADE_DECISION\",
-        \"account_id\": \"...\",
-        \"symbol\": \"AAPL\",
-        \"action\": \"BUY\" or \"SELL\",
-        \"score\": 3,
-        \"threshold_abs\": 3,
-        \"reason\": \"SCORE_THRESHOLD\"
-      }
-    """
-    if msg.get("type") != "AUTO_TRADE_DECISION":
-        return
 
-    account_id = msg["account_id"]
-    symbol = msg["symbol"]
-    action = msg["action"]
-    score = msg.get("score")
-    threshold_abs = msg.get("threshold_abs")
-    reason = msg.get("reason", "SCORE_THRESHOLD")
-    quantity = int(msg.get("shares", 1))
-
-    print(
-        f"[{_now_iso()}] AUTO_TRADE_DECISION: {action} {quantity} {symbol} "
-        f"(score={score}, threshold_abs={threshold_abs})"
+def poll_once(url: str | None = None, wait_seconds: int = 0) -> int:
+    """Receive one batch and execute it. A message is deleted only after it was handled."""
+    sqs = aws.client("sqs")
+    url = url or queue_url()
+    response = sqs.receive_message(
+        QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=wait_seconds
     )
-    last_price = _get_last_fetched_price(account_id, symbol)
-    notional = None
-    if last_price is not None and last_price > 0:
-        notional = last_price * quantity
-
-    managed_cash_before = _get_managed_cash(account_id)
-    managed_cash_after = managed_cash_before
-    trade_status = "NOOP"
-
-    table = dynamodb.Table(TABLE_NAME)
-
-    if notional is None:
-        print(f"[{_now_iso()}] No valid price for {symbol}; skipping virtual trade.")
-        trade_status = "REJECTED_NO_PRICE"
-    else:
-        if action.upper() == "BUY":
-            # Pseudo-trade: ensure enough managed cash, then increase virtual position.
-            if managed_cash_before < notional:
-                print(
-                    f"[{_now_iso()}] Insufficient managed cash for BUY {quantity} {symbol}: "
-                    f"need ~{notional:.2f}, have {managed_cash_before:.2f}. Rejecting."
-                )
-                trade_status = "REJECTED_INSUFFICIENT_MANAGED_CASH"
-            else:
-                # Decrease managed cash
-                managed_cash_after = managed_cash_before - notional
-                _update_managed_cash(account_id, managed_cash_after)
-                # Increase managed shares
-                pk = f"ACCOUNT#{account_id}"
-                sk = f"STOCK#{symbol}"
-                table.update_item(
-                    Key={"PK": pk, "SK": sk},
-                    UpdateExpression=(
-                        "SET shares_managed = if_not_exists(shares_managed, :zero) + :q, "
-                        "updated_at = :u"
-                    ),
-                    ExpressionAttributeValues={
-                        ":q": quantity,
-                        ":zero": 0,
-                        ":u": _now_iso(),
-                    },
-                )
-                trade_status = "EXECUTED_VIRTUAL"
-        elif action.upper() == "SELL":
-            # Pseudo-trade: check virtual position and decrease it, then increase cash.
-            pk = f"ACCOUNT#{account_id}"
-            sk = f"STOCK#{symbol}"
-            resp = table.get_item(Key={"PK": pk, "SK": sk})
-            item = resp.get("Item") or {}
-            current_shares = int(item.get("shares_managed", 0) or 0)
-            if current_shares < quantity:
-                print(
-                    f"[{_now_iso()}] Insufficient managed shares for SELL {quantity} {symbol}: "
-                    f"have {current_shares}. Rejecting."
-                )
-                trade_status = "REJECTED_INSUFFICIENT_SHARES"
-            else:
-                new_shares = current_shares - quantity
-                table.update_item(
-                    Key={"PK": pk, "SK": sk},
-                    UpdateExpression="SET shares_managed = :new, updated_at = :u",
-                    ExpressionAttributeValues={
-                        ":new": new_shares,
-                        ":u": _now_iso(),
-                    },
-                )
-                managed_cash_after = managed_cash_before + notional
-                _update_managed_cash(account_id, managed_cash_after)
-                trade_status = "EXECUTED_VIRTUAL"
-        else:
-            print(f"[{_now_iso()}] Unknown action '{action}' in AUTO_TRADE_DECISION")
-            trade_status = "REJECTED_BAD_ACTION"
-
-    # After any executed virtual trade, recompute positions_value and net worth.
-    if trade_status == "EXECUTED_VIRTUAL":
-        _recompute_positions_and_net_worth(account_id)
-
-    # Write a TRADE#... record into DynamoDB for logging.
-    ts = _now_iso()
-    trade_sk = f"TRADE#{ts}"
-
-    table.put_item(
-        Item={
-            "PK": f"ACCOUNT#{account_id}",
-            "SK": trade_sk,
-            "symbol": symbol,
-            "side": action,
-            "reason": reason,
-            "status": trade_status,
-            "score": score,
-            "threshold_abs": threshold_abs,
-            "quantity": quantity,
-            "last_price": last_price,
-            "managed_cash_before": managed_cash_before,
-            "managed_cash_after": managed_cash_after,
-            "created_at": ts,
-        }
-    )
+    received = response.get("Messages", [])
+    for message in received:
+        try:
+            execute_decision(messages.parse_sqs_record({"body": message["Body"]}))
+        except Exception:
+            # Left on the queue: it becomes visible again and, after maxReceiveCount
+            # deliveries, moves to the dead-letter queue.
+            logger.exception("could not process message %s", message["MessageId"])
+            continue
+        sqs.delete_message(QueueUrl=url, ReceiptHandle=message["ReceiptHandle"])
+    return len(received)
 
 
 def main() -> None:
-    # Run a quick IBKR self-test with AAPL before entering the main loop.
-    _ib_self_test()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    stopping = False
 
-    print(f"Polling SystemOpsQueue at {SYSTEM_OPS_QUEUE_URL}")
-    while True:
-        resp = sqs.receive_message(
-            QueueUrl=SYSTEM_OPS_QUEUE_URL,
-            MaxNumberOfMessages=10,
-            WaitTimeSeconds=20,
-        )
-        records = resp.get("Messages", [])
-        if not records:
-            continue
+    def _stop(*_: Any) -> None:
+        nonlocal stopping
+        stopping = True
 
-        for r in records:
-            body_str = r.get("Body", "{}")
-            try:
-                outer = json.loads(body_str)
-                inner_str = outer.get("Message", "{}")
-                msg = json.loads(inner_str)
-            except Exception as exc:
-                print(f"Failed to parse message: {exc}")
-                sqs.delete_message(
-                    QueueUrl=SYSTEM_OPS_QUEUE_URL, ReceiptHandle=r["ReceiptHandle"]
-                )
-                continue
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
 
-            handled = False
-            try:
-                msg_type = msg.get("type")
-                if msg_type == "AUTO_TRADE_DECISION":
-                    _handle_auto_trade_decision(msg)
-                    handled = True
-                elif msg_type == "NEWS_STORED":
-                    _handle_news_stored(msg)
-                    handled = True
-                # For other message types (e.g., MARK_STOCK_DELETED), do nothing
-                # here so that the SoftDelete lambda can consume them from Q2.
-            finally:
-                if handled:
-                    sqs.delete_message(
-                        QueueUrl=SYSTEM_OPS_QUEUE_URL, ReceiptHandle=r["ReceiptHandle"]
-                    )
+    url = _wait_for_queue()
+    logger.info("trade worker polling %s", url)
+    while not stopping:
+        try:
+            if poll_once(url, wait_seconds=int(os.environ.get("POLL_WAIT_SECONDS", "5"))) == 0:
+                time.sleep(0.5)
+        except Exception:
+            logger.exception("poll failed; retrying")
+            time.sleep(2)
 
-        # Small sleep to avoid tight loop if messages are constant.
-        time.sleep(1)
+
+def _wait_for_queue() -> str:
+    """The local emulator may still be starting; resolve the queue with retries."""
+    for attempt in range(60):
+        try:
+            return queue_url()
+        except Exception as exc:
+            logger.info("waiting for queue (%s)", exc)
+            time.sleep(min(2 + attempt, 5))
+    sys.exit("trade decision queue never became available")
 
 
 if __name__ == "__main__":
     main()
-
-
-

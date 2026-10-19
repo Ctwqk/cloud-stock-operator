@@ -48,6 +48,7 @@ def render_png(points: list[dict[str, Any]]) -> bytes:
     matplotlib.use("Agg")  # no display in Lambda
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
 
     fig, ax = plt.subplots(figsize=(8, 4), dpi=100)
     try:
@@ -62,6 +63,7 @@ def render_png(points: list[dict[str, Any]]) -> bytes:
             ax.set_ylabel("net worth")
             ax.set_title("Managed net worth")
             ax.grid(alpha=0.3)
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.2f}"))
             locator = mdates.AutoDateLocator()
             ax.xaxis.set_major_locator(locator)
             ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))

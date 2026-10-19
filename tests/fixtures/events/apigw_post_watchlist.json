@@ -1,0 +1,19 @@
+{
+  "resource": "/{proxy+}",
+  "path": "/watchlist",
+  "httpMethod": "POST",
+  "headers": {"Content-Type": "application/json", "x-api-key": "test-key"},
+  "multiValueHeaders": {"Content-Type": ["application/json"]},
+  "queryStringParameters": null,
+  "pathParameters": {"proxy": "watchlist"},
+  "stageVariables": null,
+  "requestContext": {
+    "resourcePath": "/{proxy+}",
+    "httpMethod": "POST",
+    "path": "/prod/watchlist",
+    "stage": "prod",
+    "identity": {"sourceIp": "203.0.113.10", "apiKeyId": "abcdefghij"}
+  },
+  "body": "{\"symbol\": \"aapl\", \"shares_managed\": 3}",
+  "isBase64Encoded": false
+}

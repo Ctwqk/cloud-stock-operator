@@ -1,0 +1,20 @@
+{
+  "Records": [
+    {
+      "messageId": "059f36b4-87a3-44ab-83d2-661975830a7d",
+      "receiptHandle": "AQEBwJnKyrHigUMZj6rYigCgxlaS3SLy0a...",
+      "body": "{\n  \"Type\" : \"Notification\",\n  \"MessageId\" : \"c3b5f3a0-6e4a-5a8a-9d0e-1f2b3c4d5e6f\",\n  \"TopicArn\" : \"arn:aws:sns:us-east-1:123456789012:SystemOpsTopic\",\n  \"Message\" : \"{\\\"type\\\": \\\"NEW_NEWS\\\", \\\"news_id\\\": \\\"abc123\\\", \\\"account_id\\\": \\\"123456789012\\\", \\\"symbol\\\": \\\"AAPL\\\", \\\"headline\\\": \\\"Apple beats earnings estimates\\\", \\\"body\\\": \\\"Revenue topped forecasts.\\\", \\\"source\\\": \\\"wire\\\", \\\"published_at\\\": \\\"2025-12-01T14:05:00.000000Z\\\"}\",\n  \"Timestamp\" : \"2025-12-01T14:05:01.123Z\",\n  \"SignatureVersion\" : \"1\",\n  \"MessageAttributes\" : {\"type\" : {\"Type\":\"String\",\"Value\":\"NEW_NEWS\"}}\n}",
+      "attributes": {
+        "ApproximateReceiveCount": "1",
+        "SentTimestamp": "1764597901150",
+        "SenderId": "AIDAIT2UOQQY3AUEKVGXU",
+        "ApproximateFirstReceiveTimestamp": "1764597901160"
+      },
+      "messageAttributes": {},
+      "md5OfBody": "e4e68fb7bd0e697a0ae8f1bb342846b3",
+      "eventSource": "aws:sqs",
+      "eventSourceARN": "arn:aws:sqs:us-east-1:123456789012:NewsIngestQueue",
+      "awsRegion": "us-east-1"
+    }
+  ]
+}

@@ -30,6 +30,7 @@ def cleanup_news_for_symbol(bucket: str, symbol: str, today: date | None = None)
     soft_cutoff = today - SOFT_DELETE_AFTER
     hard_cutoff = today - HARD_DELETE_AFTER
     result = {"soft_tagged": 0, "hard_deleted": 0}
+    failures = 0
 
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=f"news/{symbol.upper()}/"):
@@ -50,7 +51,10 @@ def cleanup_news_for_symbol(bucket: str, symbol: str, today: date | None = None)
                     )
                     result["soft_tagged"] += 1
             except Exception:  # best effort: one bad object must not block the rest
+                failures += 1
                 logger.exception("retention cleanup failed for %s", key)
+    if failures:
+        raise RuntimeError(f"retention cleanup for {symbol}: {failures} object operation(s) failed")
     return result
 
 

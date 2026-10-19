@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from common import retention, timeutil
+from common import aws, retention, timeutil
 from news_retention_cleaner.main import handler as cleaner
 from soft_delete.main import handler as soft_delete
 from tests.helpers import sqs_event
@@ -143,3 +143,38 @@ class TestRetentionCleanerLambda:
 
     def test_no_deleted_stocks(self, cloud, table):
         assert cleaner(None, None) == {"stocks": 0, "soft_tagged": 0, "hard_deleted": 0}
+
+
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_partial_s3_failures_are_retried(cloud, table, s3, monkeypatch, scheduled):
+    add_stock(table, is_deleted=scheduled)
+    failed_key = put_news(s3, cloud, "AAPL", 50, "a-fails")
+    healthy_key = put_news(s3, cloud, "AAPL", 50, "z-works")
+    if scheduled:
+        add_stock(table, "MSFT", is_deleted=True)
+        other_key = put_news(s3, cloud, "MSFT", 50)
+    client = aws.client("s3")
+    real_delete = client.delete_object
+
+    def flaky_delete(**kwargs):
+        if kwargs["Key"] == failed_key:
+            raise RuntimeError("S3 temporarily unavailable")
+        return real_delete(**kwargs)
+
+    monkeypatch.setattr(client, "delete_object", flaky_delete)
+    event = sqs_event({"type": "MARK_STOCK_DELETED", "account_id": ACCOUNT, "symbol": "AAPL"})
+    if scheduled:
+        with pytest.raises(RuntimeError, match="retention cleanup failed"):
+            cleaner({})
+        assert other_key not in keys_in_bucket(s3, cloud)
+    else:
+        assert soft_delete(event) == {"batchItemFailures": [{"itemIdentifier": "m-0"}]}
+    assert healthy_key not in keys_in_bucket(s3, cloud)
+    assert failed_key in keys_in_bucket(s3, cloud)
+
+    monkeypatch.setattr(client, "delete_object", real_delete)
+    if scheduled:
+        assert cleaner({})["hard_deleted"] == 1
+    else:
+        assert soft_delete(event) == {"batchItemFailures": []}
+    assert failed_key not in keys_in_bucket(s3, cloud)

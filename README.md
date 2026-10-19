@@ -6,7 +6,7 @@ A serverless, event-driven watchlist and **paper-trading** system on AWS, define
 
 ![Control panel of the local demo: watchlist with sentiment scores, virtual trades and the net-worth chart](docs/screenshot.png)
 
-*The local demo after a couple of minutes: five stocks, scored headlines, executed virtual trades and the net-worth chart rendered by the plotter Lambda. News and prices in the demo are canned fixtures (see [Local demo](#local-demo)).*
+*The local demo after seeding: five stocks, scored headlines, executed virtual trades and the net-worth chart rendered by the plotter Lambda. News and prices in the demo are canned fixtures (see [Local demo](#local-demo)).*
 
 ## What it does
 
@@ -125,7 +125,7 @@ All items of one tenant share a partition: `PK = ACCOUNT#<account_id>` (the AWS 
 | `TRADE#<ts>#<decision_id>` | virtual trade log, including `REJECTED_*` | trade worker |
 | `SCORE#<SYMBOL>#<ts>` | sentiment history per stock | scorer |
 | `NEWSHASH#<SYMBOL>#<hash>` | "news already seen" marker, TTL | fetcher |
-| `SCORED#<news_id>` | "already scored" marker, TTL | scoring |
+| `SCORED#<news_id>` | scoring result and immutable decision payload for delivery retries, TTL | scoring |
 | `OP#<op_id>` | outcome of an asynchronous command (`APPLIED`/`REJECTED`), TTL | `stock_info_writer` |
 | `DECISION#<decision_id>` | "trade already executed" marker, TTL | trade worker |
 
@@ -141,7 +141,7 @@ Prerequisites: [uv](https://docs.astral.sh/uv/), Node.js 22 (CDK tests and `cdk 
 
 ```bash
 make install        # uv sync: locked Python 3.12 environment
-make test           # 295 tests: handlers on moto, CDK assertions, end-to-end pipeline
+make test           # handlers on moto, CDK assertions, end-to-end pipeline
 make lint           # ruff check + format check
 make synth          # cdk synth, offline, no AWS credentials
 ```
@@ -163,7 +163,16 @@ What is real and what is canned in the demo:
 
 `make smoke` (also run in CI) starts the demo, waits until trades appear in the UI and tears it down. To try the real yfinance provider, run the fetcher with `NEWS_PROVIDER=yfinance` and the layer built by `make layers`.
 
-Without Docker: `uv run python local_app/local_cloud.py` starts the emulator on `:5000`/`:8000`; the other pieces are plain scripts (`PYTHONPATH=lambda:local_app`, `AWS_ENDPOINT_URL=http://127.0.0.1:5000`; see [`local_app/.env.example`](local_app/.env.example)).
+To reproduce the screenshot with Playwright (Node.js required):
+
+```bash
+npx --yes playwright@1.57.0 install chromium  # skip if this browser is already cached
+CAPTURE_SCREENSHOT=1 WEB_PORT=41090 make smoke
+```
+
+This waits for virtual trades and at least three scheduled snapshots, generates the plot through the UI, writes `docs/screenshot.png`, and stops the stack. `CHROMIUM_PATH` can select an existing Chromium executable. The demo binds to localhost; each service has a memory and process limit.
+
+For development without Docker, `PYTHONPATH=lambda:local_app uv run python local_app/local_cloud.py` starts the emulator on `:5000`/`:8000`. The web UI, seed and worker are separate scripts; configure their environment from `docker-compose.yml`, replacing the `cloud` hostname with `127.0.0.1`. The [environment example](local_app/.env.example) describes connections to a deployed AWS stack.
 
 ### Deploying to AWS (documented, not executed in this repo's CI)
 
@@ -202,7 +211,7 @@ Each Lambda is packaged from `lambda/`: its own package plus `common/` (the CDK 
 
 ## Tests
 
-`make test` runs 295 tests in about a minute (coverage ~91 %):
+`make test` runs the suite (coverage ~91 %):
 
 * every Lambda handler against moto (DynamoDB, S3, SNS, SQS, STS) with realistic event shapes (SNS-in-SQS envelope, API Gateway proxy, EventBridge scheduled event, yfinance payloads) kept under `tests/fixtures/`;
 * regression tests for each bug listed below;
@@ -211,11 +220,13 @@ Each Lambda is packaged from `lambda/`: its own package plus `common/` (the CDK 
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): ruff lint and format check; pytest with a coverage gate; `cdk synth` with the CLI; layer build and size check; the docker compose smoke test.
 
+See the [verification record](docs/verification.md) for commands, measured coverage, offline synthesis and screenshot evidence.
+
 ## Design notes and trade-offs
 
 * **At-least-once delivery is assumed everywhere.** Commands carry an `op_id`; the state change and an `OP#` marker are written in one DynamoDB transaction. News ids are content hashes (deterministic S3 key, `SCORED#` marker). Trade decisions carry a deterministic `decision_id`, and the worker executes cash, shares, trade log and a `DECISION#` marker in a single transaction. Handlers return per-message failures (`ReportBatchItemFailures`), so one bad message is retried and eventually dead-lettered without replaying the batch.
-* **Balance changes go through the queue, absolute settings do not.** Add-stock, cash and share deltas are validated by the API, applied by one writer (`stock_info_writer`) with optimistic concurrency, and answered with `202` + `GET /operations/{id}`. Threshold and externally supplied sentiment are idempotent absolute writes and stay synchronous.
-* **A decision consumes the score.** After a BUY/SELL decision the stock's score resets to 0 (`decision_count` advances), so neutral news cannot re-trigger the same trade.
+* **Balance commands go through the queue.** Add-stock, cash and share deltas are validated by the API, applied by `stock_info_writer` with optimistic concurrency, and answered with `202` + `GET /operations/{id}`. Threshold settings and externally supplied sentiment stay synchronous. Sentiment is a delta: callers must supply a stable `event_id` when retrying `POST /sentiment`.
+* **A decision consumes the score atomically.** The score resets to 0, `decision_count` advances, and the immutable decision payload is saved on the `SCORED#` marker in one transaction. A failed or ambiguous SNS publish replays that payload on redelivery, even after other headlines arrive. Optimistic conditions protect the score, threshold and decision counter from concurrent changes. The worker requires a stable decision ID and a positive whole-number quantity.
 * **Sentiment is a lexicon, on purpose.** VADER plus ~100 finance terms is deterministic, tiny (fits a layer, no model download) and testable. It sits behind `SentimentScorer`; a model-backed scorer can be added to `BACKENDS`. It looks at one headline and summary at a time and misses context and sarcasm.
 * **The local runtime reuses the production wiring.** `local_cloud.py` builds queues and filter subscriptions from the same `topology.py` as the CDK stack and calls the real handlers, so the demo exercises the deployed routing rather than a re-implementation. moto is not AWS, though: see below.
 * **Trade-off, news retention:** news of active stocks is never expired; only soft-deleted stocks are cleaned (tag after 3 weeks, delete after 6).
@@ -229,9 +240,10 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): ruff lint and forma
 ## Known limitations and roadmap
 
 * **Not deployed or verified on real AWS** (no credentials were available): correctness rests on moto, CDK assertions and `cdk synth`. IAM completeness, API Gateway behaviour and real SNS filtering are untested.
-* The demo uses fixture news; live yfinance was only checked manually (prices work; `Ticker.news` returned an empty list at the time, so the provider falls back to `yf.Search`). yfinance is an unofficial API and can break.
+* Live yfinance is not exercised in CI or the deterministic demo. Provider tests use recorded payloads, including the `Ticker.news` / `yf.Search` fallback. yfinance is an unofficial API and can break.
 * Single tenant: the account id is the AWS account id, and S3 news keys are not account-scoped (a soft delete affects every account's news for that symbol).
 * The API key is a shared secret; there is no per-user auth. No CloudWatch alarms on the DLQs.
+* Standard SQS queues can deliver decisions out of order. Deduplication is bounded by marker retention (30 days for commands, 45 days for scoring/trades); replay failed deliveries from the DLQ before those markers expire. Cached summary valuations are eventually consistent with concurrent trades and price changes.
 * The retention cleaner scans the table once a day; fine at this size, not at scale.
 * Roadmap ideas: alarms on DLQ depth, Cognito/IAM auth, a model-backed scorer behind the same interface, account-scoped S3 keys, a read API so the UI does not need DynamoDB credentials.
 

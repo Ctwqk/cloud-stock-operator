@@ -21,7 +21,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"${COMPOSE[@]}" up --build -d
+if [ "${SKIP_BUILD:-0}" = 1 ]; then
+  "${COMPOSE[@]}" up --no-build -d
+else
+  "${COMPOSE[@]}" up --build -d
+fi
 
 echo "waiting for trades on http://localhost:${WEB_PORT} ..."
 for _ in $(seq 1 90); do
@@ -36,3 +40,9 @@ grep -q "executed virtual" <<<"${page}" || { echo "no executed trades appeared" 
 grep -q "AAPL" <<<"${page}" || { echo "watchlist missing AAPL" >&2; exit 1; }
 grep -q "Managed net worth" <<<"${page}" || { echo "summary missing" >&2; exit 1; }
 echo "local demo OK: news was fetched, scored and traded."
+
+if [ "${CAPTURE_SCREENSHOT:-0}" = 1 ]; then
+  export WEB_URL="http://127.0.0.1:${WEB_PORT}"
+  npx --yes --package=playwright@1.57.0 -c \
+    'NODE_PATH="$(dirname "$(dirname "$(command -v playwright)")")" node scripts/capture_screenshot.js'
+fi

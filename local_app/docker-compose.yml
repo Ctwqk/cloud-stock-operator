@@ -16,6 +16,7 @@ x-app: &app
     context: ..
     dockerfile: local_app/Dockerfile
   restart: unless-stopped
+  pids_limit: 256
 
 x-client-env: &client-env
   AWS_ACCESS_KEY_ID: local
@@ -32,6 +33,7 @@ services:
   cloud:
     <<: *app
     command: ["python", "local_app/local_cloud.py"]
+    mem_limit: 1g
     environment:
       AWS_ACCESS_KEY_ID: local
       AWS_SECRET_ACCESS_KEY: local
@@ -51,6 +53,7 @@ services:
     <<: *app
     restart: "no"
     command: ["python", "local_app/demo_seed.py"]
+    mem_limit: 256m
     environment: *client-env
     depends_on:
       cloud:
@@ -59,6 +62,7 @@ services:
   worker:
     <<: *app
     command: ["python", "local_app/local_trade_worker.py"]
+    mem_limit: 384m
     environment: *client-env
     depends_on:
       cloud:
@@ -67,9 +71,10 @@ services:
   web:
     <<: *app
     command: ["python", "local_app/web_app.py"]
+    mem_limit: 512m
     environment: *client-env
     ports:
-      - "${WEB_PORT:-9090}:9090"
+      - "127.0.0.1:${WEB_PORT:-9090}:9090"
     depends_on:
       cloud:
         condition: service_healthy

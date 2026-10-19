@@ -8,6 +8,8 @@ x-app: &app
     context: ..
     dockerfile: local_app/Dockerfile
   restart: unless-stopped
+  mem_limit: 512m
+  pids_limit: 256
   environment: &env
     AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:?set AWS_DEFAULT_REGION}
     AWS_PROFILE: ${AWS_PROFILE:-default}
@@ -29,4 +31,4 @@ services:
     <<: *app
     command: ["python", "local_app/web_app.py"]
     ports:
-      - "${WEB_PORT:-9090}:9090"
+      - "127.0.0.1:${WEB_PORT:-9090}:9090"

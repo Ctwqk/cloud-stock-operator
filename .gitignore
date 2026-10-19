@@ -30,6 +30,7 @@ Thumbs.db
 # Local environment / secrets
 .env
 .env.*
+!.env.example
 
 # Lambda layers and large local artifacts
 layers/build/
@@ -42,3 +43,5 @@ layers/build/
 htmlcov/
 .ruff_cache/
 node_modules/
+output/playwright/
+.playwright-cli/

@@ -14,7 +14,8 @@ Two kinds of operations:
 * **Commands that move balances** (add stock, cash, shares) are validated here, published to
   ``ExternalOpsTopic`` and applied by the ``stock_info_writer`` Lambda, the only writer of those
   fields. They return ``202`` plus an ``op_id``; poll ``GET /operations/{op_id}`` for the result.
-* **Idempotent absolute writes** (threshold, sentiment score) are applied synchronously.
+* Threshold settings and sentiment deltas are applied synchronously. Sentiment callers
+  must provide a stable event_id for retry deduplication.
 """
 
 from __future__ import annotations

@@ -135,6 +135,20 @@ class TestRejections:
         with pytest.raises(ValueError):
             worker.execute_decision(decision(shares=-1, **{}))
 
+    @pytest.mark.parametrize("quantity", [0, True, 1.5, "NaN"])
+    def test_invalid_quantities_never_move_balances(self, account, quantity):
+        with pytest.raises(ValueError):
+            worker.execute_decision(decision(shares=quantity))
+        assert shares(account) == 2
+        assert trades(account) == []
+
+    @pytest.mark.parametrize("decision_id", [None, "", "   "])
+    def test_decisions_require_a_stable_id(self, account, decision_id):
+        with pytest.raises(ValueError, match="decision_id"):
+            worker.execute_decision(decision(decision_id=decision_id))
+        assert shares(account) == 2
+        assert trades(account) == []
+
 
 class TestIdempotency:
     def test_same_decision_executes_once(self, account):

@@ -158,3 +158,71 @@ def test_redelivery_after_failed_publish_still_emits_the_decision(cloud, table, 
     assert result.action == "BUY"
     assert len(decisions(cloud)) == 1
     assert int(stock(table)["current_level_score"]) == 0
+
+
+def test_failed_publish_survives_opposite_news(cloud, table, monkeypatch):
+    """Later negative news must not erase a BUY awaiting SNS delivery."""
+    put_stock(table, threshold_abs=1)
+    real_publish = messages.publish
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("SNS unavailable")
+
+    monkeypatch.setattr(messages, "publish", unavailable)
+    with pytest.raises(RuntimeError):
+        apply(cloud, 1, "buy")
+    monkeypatch.setattr(messages, "publish", real_publish)
+
+    apply(cloud, -1, "sell")
+    apply(cloud, 1, "buy")  # retry the original delivery after other news arrived
+    sent = {d["decision_id"]: d["action"] for d in decisions(cloud)}
+    assert sent == {f"{ACCOUNT}:AAPL:1": "BUY", f"{ACCOUNT}:AAPL:2": "SELL"}
+    assert stock(table)["current_level_score"] == 0
+
+
+def test_concurrent_score_update_gets_distinct_decision_ids(cloud, table, monkeypatch):
+    """Interleave another transaction after the outer scorer reads the stock."""
+    from common import aws
+
+    put_stock(table, threshold_abs=1)
+    client = aws.ddb_client()
+    real_transact = client.transact_write_items
+    interleaved = False
+
+    def transact(**kwargs):
+        nonlocal interleaved
+        if not interleaved:
+            interleaved = True
+            apply(cloud, -1, "concurrent")
+        return real_transact(**kwargs)
+
+    monkeypatch.setattr(client, "transact_write_items", transact)
+    apply(cloud, 1, "outer")
+    sent = decisions(cloud)
+    assert [(d["decision_id"], d["action"]) for d in sent] == [
+        (f"{ACCOUNT}:AAPL:1", "SELL"),
+        (f"{ACCOUNT}:AAPL:2", "BUY"),
+    ]
+    assert stock(table)["decision_count"] == 2
+
+
+def test_ambiguous_publish_retry_keeps_original_payload(cloud, table, monkeypatch):
+    """SNS accepted the message, but the client lost the acknowledgement."""
+    put_stock(table, threshold_abs=1)
+    real_publish = messages.publish
+
+    def accepted_then_failed(*args, **kwargs):
+        real_publish(*args, **kwargs)
+        raise RuntimeError("connection lost after publish")
+
+    monkeypatch.setattr(messages, "publish", accepted_then_failed)
+    with pytest.raises(RuntimeError):
+        apply(cloud, 1, "buy", headline="original")
+    monkeypatch.setattr(messages, "publish", real_publish)
+    apply(cloud, -1, "sell")
+    apply(cloud, -1, "buy", headline="changed on retry")
+    sent = decisions(cloud)
+    buys = [d for d in sent if d["decision_id"] == f"{ACCOUNT}:AAPL:1"]
+    assert len(buys) == 2 and buys[0] == buys[1]
+    assert buys[0]["action"] == "BUY"
+    assert stock(table)["decision_count"] == 2

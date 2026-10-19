@@ -1,26 +1,16 @@
-"""Apply a sentiment delta to a watchlist entry and emit trade decisions.
+"""Apply sentiment once and persist immutable trade decisions before publishing.
 
-Used by the sentiment scorer Lambda (news -> delta) and by the control plane's
-``POST /sentiment`` endpoint (an external scorer posts a delta).
-
-Semantics
----------
-* Each stock keeps a running ``current_level_score``. A news item adds ``delta`` (+1/0/-1).
-* When ``|score| >= threshold_abs`` an ``AUTO_TRADE_DECISION`` (BUY if positive, SELL if
-  negative) is published and the score is reset to 0: a decision *consumes* the accumulated
-  signal, so neutral news can no longer re-trigger the same trade.
-* Applying the same ``dedupe_id`` twice changes nothing (SQS is at-least-once): a marker item
-  and the score update are written in one DynamoDB transaction.
-* Decisions carry a deterministic ``decision_id`` (``<account>:<symbol>:<n>``), so a retry after
-  a crash between "publish" and "reset score" produces an identical message that the trade
-  worker ignores.
+The SCORED marker, score/history update and decision counter are one DynamoDB transaction.
+The marker also stores the decision payload (a small transactional outbox). If SNS fails,
+redelivery publishes that exact payload, even if later news has changed the stock's score.
+Concurrent score updates use optimistic conditions; duplicate publishes are safe because the
+trade worker applies each decision_id once. Exhausted delivery retries go to the queue's DLQ.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import Any
 
 from botocore.exceptions import ClientError
@@ -57,152 +47,120 @@ def apply_sentiment(
     table = aws.table()
     pk = keys.account_pk(account_id)
     stock_key = {"PK": pk, "SK": keys.stock_sk(symbol)}
+    marker_key = {"PK": pk, "SK": keys.scored_sk(dedupe_id)}
 
-    item = table.get_item(Key=stock_key, ConsistentRead=True).get("Item")
-    if not item or item.get("is_deleted"):
-        logger.warning("sentiment for unknown or deleted symbol %s ignored", symbol)
-        return ScoreResult(status="unknown_symbol", symbol=symbol)
-
-    now = timeutil.iso_utc()
-    ttl = timeutil.epoch_in(days=MARKER_TTL_DAYS)
-    status = "applied"
-    try:
-        aws.ddb_client().transact_write_items(
-            TransactItems=[
-                {
-                    "Put": {
-                        "TableName": table.name,
-                        "Item": {
-                            "PK": pk,
-                            "SK": keys.scored_sk(dedupe_id),
-                            "symbol": symbol,
-                            "created_at": now,
-                            keys.TTL_ATTRIBUTE: ttl,
-                        },
-                        "ConditionExpression": "attribute_not_exists(PK)",
-                    }
-                },
-                {
-                    "Update": {
-                        "TableName": table.name,
-                        "Key": stock_key,
-                        "UpdateExpression": (
-                            "SET current_level_score = "
-                            "if_not_exists(current_level_score, :zero) + :delta, "
-                            "last_sentiment = :delta, last_headline = :headline, updated_at = :now"
-                        ),
-                        "ConditionExpression": "attribute_exists(PK)",
-                        "ExpressionAttributeValues": {
-                            ":zero": 0,
-                            ":delta": delta,
-                            ":headline": headline[:300],
-                            ":now": now,
-                        },
-                    }
-                },
-                {
-                    "Put": {
-                        "TableName": table.name,
-                        "Item": {
-                            "PK": pk,
-                            "SK": keys.score_sk(symbol, now),
-                            "symbol": symbol,
-                            "delta_score": delta,
-                            "reason": reason,
-                            "headline": headline[:300],
-                            "created_at": now,
-                        },
-                    }
-                },
-            ]
-        )
-    except ClientError as exc:
-        codes = ddb.cancellation_codes(exc)
-        if codes[:1] == ["ConditionalCheckFailed"]:
-            status = "duplicate"
-        elif codes[1:2] == ["ConditionalCheckFailed"]:
-            # the stock vanished between our read and the write
+    for _ in range(4):
+        previous = table.get_item(Key=marker_key, ConsistentRead=True).get("Item")
+        if previous:
+            return _deliver(previous, topic_arn, "duplicate")
+        item = table.get_item(Key=stock_key, ConsistentRead=True).get("Item")
+        if not item or item.get("is_deleted"):
+            logger.warning("sentiment for unknown or deleted symbol %s ignored", symbol)
             return ScoreResult(status="unknown_symbol", symbol=symbol)
-        else:
-            raise
 
-    # Threshold evaluation is idempotent, so it also runs for duplicates (this completes a
-    # decision whose publish step was interrupted on the first delivery).
-    return _evaluate_threshold(
-        pk=pk, stock_key=stock_key, topic_arn=topic_arn, reason=reason, delta=delta, status=status
-    )
-
-
-def _evaluate_threshold(
-    *, pk: str, stock_key: dict[str, str], topic_arn: str, reason: str, delta: int, status: str
-) -> ScoreResult:
-    table = aws.table()
-    item = table.get_item(Key=stock_key, ConsistentRead=True)["Item"]
-    symbol = str(item["symbol"])
-    score = ddb.to_int(item.get("current_level_score", 0))
-    threshold = (
-        ddb.to_int(item.get("threshold_abs", DEFAULT_THRESHOLD_ABS)) or DEFAULT_THRESHOLD_ABS
-    )
-    threshold = abs(threshold)
-    decisions_made = ddb.to_int(item.get("decision_count", 0))
-
-    action: str | None = None
-    if score >= threshold:
-        action = "BUY"
-    elif score <= -threshold:
-        action = "SELL"
-
-    decision_id = None
-    if action:
-        account_id = pk.split("#", 1)[1]
-        decision_id = f"{account_id}:{symbol}:{decisions_made + 1}"
-        messages.publish(
-            topic_arn,
-            {
+        score = ddb.to_int(item.get("current_level_score", 0)) + delta
+        threshold = abs(ddb.to_int(item.get("threshold_abs", 1))) or DEFAULT_THRESHOLD_ABS
+        count = ddb.to_int(item.get("decision_count", 0))
+        action = "BUY" if score >= threshold else "SELL" if score <= -threshold else None
+        now = timeutil.iso_utc()
+        marker: dict[str, Any] = {
+            **marker_key,
+            "symbol": symbol,
+            "delta": delta,
+            "score": score,
+            "threshold_abs": threshold,
+            "created_at": now,
+            keys.TTL_ATTRIBUTE: timeutil.epoch_in(days=MARKER_TTL_DAYS),
+        }
+        if action:
+            marker["decision"] = {
                 "type": messages.AUTO_TRADE_DECISION,
-                "decision_id": decision_id,
+                "decision_id": f"{account_id}:{symbol}:{count + 1}",
                 "account_id": account_id,
                 "symbol": symbol,
                 "action": action,
                 "score": score,
                 "threshold_abs": threshold,
                 "reason": reason,
-            },
-        )
-        _consume_signal(table, stock_key, decisions_made, score)
+            }
 
+        values: dict[str, Any] = {
+            ":next_score": 0 if action else score,
+            ":next_count": count + bool(action),
+            ":delta": delta,
+            ":headline": headline[:300],
+            ":now": now,
+            ":false": False,
+        }
+        conditions = [
+            "attribute_exists(PK)",
+            "(attribute_not_exists(is_deleted) OR is_deleted = :false)",
+        ]
+        # Guard every input to the decision, including a concurrent threshold change.
+        for attr in ("current_level_score", "threshold_abs", "decision_count"):
+            if attr in item:
+                conditions.append(f"{attr} = :old_{attr}")
+                values[f":old_{attr}"] = item[attr]
+            else:
+                conditions.append(f"attribute_not_exists({attr})")
+        try:
+            aws.ddb_client().transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": table.name,
+                            "Item": marker,
+                            "ConditionExpression": "attribute_not_exists(PK)",
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": table.name,
+                            "Key": stock_key,
+                            "UpdateExpression": (
+                                "SET current_level_score = :next_score, "
+                                "decision_count = :next_count, last_sentiment = :delta, "
+                                "last_headline = :headline, updated_at = :now"
+                            ),
+                            "ConditionExpression": " AND ".join(conditions),
+                            "ExpressionAttributeValues": values,
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": table.name,
+                            "Item": {
+                                "PK": pk,
+                                "SK": keys.score_sk(symbol, now),
+                                "symbol": symbol,
+                                "delta_score": delta,
+                                "reason": reason,
+                                "headline": headline[:300],
+                                "created_at": now,
+                            },
+                        }
+                    },
+                ]
+            )
+        except ClientError as exc:
+            if "ConditionalCheckFailed" in ddb.cancellation_codes(exc)[:2]:
+                continue  # reread a competing marker or changed stock, then reevaluate
+            raise
+        return _deliver(marker, topic_arn, "applied")
+    raise RuntimeError(f"concurrent sentiment updates for {symbol}; retry this event")
+
+
+def _deliver(marker: dict[str, Any], topic_arn: str, status: str) -> ScoreResult:
+    """Replay only the recorded decision; never reevaluate a duplicate against newer news."""
+    decision = marker.get("decision") or {}
+    if decision:
+        messages.publish(topic_arn, decision)
     return ScoreResult(
         status=status,
-        symbol=symbol,
-        delta=delta,
-        score=score,
-        threshold_abs=threshold,
-        action=action,
-        decision_id=decision_id,
+        symbol=marker["symbol"],
+        delta=ddb.to_int(marker.get("delta", 0)),
+        score=ddb.to_int(marker.get("score", 0)),
+        threshold_abs=ddb.to_int(marker.get("threshold_abs", DEFAULT_THRESHOLD_ABS)),
+        action=decision.get("action"),
+        decision_id=decision.get("decision_id"),
     )
-
-
-def _consume_signal(table: Any, stock_key: dict[str, str], decisions_made: int, score: int) -> None:
-    """Reset the score after a decision, but only if nobody else changed it meanwhile."""
-    try:
-        table.update_item(
-            Key=stock_key,
-            UpdateExpression=(
-                "SET current_level_score = :zero, decision_count = :next, updated_at = :now"
-            ),
-            ConditionExpression=(
-                "(attribute_not_exists(decision_count) OR decision_count = :seen) "
-                "AND current_level_score = :score"
-            ),
-            ExpressionAttributeValues={
-                ":zero": 0,
-                ":next": decisions_made + 1,
-                ":seen": decisions_made,
-                ":score": Decimal(score),
-                ":now": timeutil.iso_utc(),
-            },
-        )
-    except ClientError as exc:
-        if not ddb.is_conditional_failure(exc):
-            raise
-        logger.info("score changed concurrently; leaving it for the next evaluation")

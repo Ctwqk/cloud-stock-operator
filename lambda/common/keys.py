@@ -11,7 +11,7 @@ sort key's prefix says what the item is::
     TRADE#<ts>#<decision_id>            virtual trade log written by the local worker
     SCORE#<SYMBOL>#<ts>                 sentiment history for one stock
     NEWSHASH#<SYMBOL>#<hash>            news de-duplication marker        (TTL)
-    SCORED#<news_id>                    "this news was already scored"     (TTL)
+    SCORED#<news_id>                    score result + decision for retry  (TTL)
     OP#<op_id>                          result of an external command      (TTL)
     DECISION#<decision_id>              "this trade decision was executed" (TTL)
 

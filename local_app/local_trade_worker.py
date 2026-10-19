@@ -58,8 +58,10 @@ def execute_decision(msg: dict[str, Any]) -> str:
     account_id = str(msg["account_id"])
     symbol = messages.normalize_symbol(msg["symbol"])
     action = str(msg["action"]).upper()
-    quantity = int(msg.get("shares") or os.environ.get("TRADE_QUANTITY", "1"))
-    decision_id = str(msg.get("decision_id") or f"adhoc-{timeutil.iso_utc()}")
+    quantity = ddb.to_int(msg.get("shares", os.environ.get("TRADE_QUANTITY", "1")), "shares")
+    decision_id = msg.get("decision_id")
+    if not isinstance(decision_id, str) or not decision_id.strip():
+        raise ValueError("decision_id must be a nonempty stable string")
     if quantity < 1:
         raise ValueError("shares must be >= 1")
 

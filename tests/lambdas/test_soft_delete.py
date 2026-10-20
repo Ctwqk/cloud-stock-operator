@@ -118,6 +118,58 @@ class TestSoftDeleteLambda:
         assert soft_delete(sqs_event(self.message("NOPE")), None) == {"batchItemFailures": []}
         assert stock(table, "NOPE") is None
 
+    def test_unknown_stock_does_not_delete_news(self, cloud, table, s3):
+        key = put_news(s3, cloud, "NOPE", 60)
+        assert soft_delete(sqs_event(self.message("NOPE"))) == {"batchItemFailures": []}
+        assert key in keys_in_bucket(s3, cloud)
+
+    def test_old_delete_redelivery_does_not_undo_reactivation(self, cloud, table, s3):
+        from stock_info_writer.main import handler as add
+
+        add_stock(table)
+        event = sqs_event({**self.message(), "op_id": "delete-1"})
+        assert soft_delete(event) == {"batchItemFailures": []}
+        add(
+            sqs_event(
+                {"type": "ADD_STOCK", "account_id": ACCOUNT, "symbol": "AAPL", "op_id": "re-add"}
+            )
+        )
+        key = put_news(s3, cloud, "AAPL", 60)
+        assert soft_delete(event) == {"batchItemFailures": []}
+        assert stock(table)["is_deleted"] is False
+        assert key in keys_in_bucket(s3, cloud)
+
+    def test_concurrent_delete_prevents_share_adjustment(self, cloud, table, monkeypatch):
+        from stock_info_writer.main import handler as adjust
+
+        add_stock(table, shares_managed=5)
+        client = aws.ddb_client()
+        transact = client.transact_write_items
+
+        def delete_before_write(**kwargs):
+            table.update_item(
+                Key={"PK": PK, "SK": "STOCK#AAPL"},
+                UpdateExpression="SET is_deleted = :deleted",
+                ExpressionAttributeValues={":deleted": True},
+            )
+            return transact(**kwargs)
+
+        monkeypatch.setattr(client, "transact_write_items", delete_before_write)
+        event = sqs_event(
+            {
+                "type": "ADJUST_MANAGED_SHARES",
+                "account_id": ACCOUNT,
+                "symbol": "AAPL",
+                "op_id": "shares",
+                "delta_shares": 1,
+                "max_shares_allowed": 100,
+            }
+        )
+        assert adjust(event) == {"batchItemFailures": [{"itemIdentifier": "m-0"}]}
+        assert stock(table)["shares_managed"] == 5
+        assert adjust(event) == {"batchItemFailures": []}
+        assert table.get_item(Key={"PK": PK, "SK": "OP#shares"})["Item"]["status"] == "REJECTED"
+
     def test_other_message_types_are_ignored(self, cloud, table):
         add_stock(table)
         soft_delete(sqs_event({"type": "NEW_NEWS", "account_id": ACCOUNT, "symbol": "AAPL"}), None)
@@ -169,6 +221,8 @@ def test_partial_s3_failures_are_retried(cloud, table, s3, monkeypatch, schedule
         assert other_key not in keys_in_bucket(s3, cloud)
     else:
         assert soft_delete(event) == {"batchItemFailures": [{"itemIdentifier": "m-0"}]}
+        # S3 trouble must not leave a deleted symbol eligible for further trades.
+        assert stock(table)["is_deleted"] is True
     assert healthy_key not in keys_in_bucket(s3, cloud)
     assert failed_key in keys_in_bucket(s3, cloud)
 

@@ -191,6 +191,8 @@ def _adjust_shares(account_id: str, op_id: str, msg: dict[str, Any]) -> None:
     else:
         condition = "attribute_exists(PK) AND shares_managed = :current"
         values[":current"] = current
+    condition += " AND (attribute_not_exists(is_deleted) OR is_deleted = :false)"
+    values[":false"] = False
     applied = _apply_once(
         account_id,
         op_id,

@@ -129,7 +129,12 @@ def delete_watchlist(account_id: str, body: dict[str, Any], params: dict[str, st
     symbol = _symbol(params["symbol"])
     messages.publish(
         aws.require_env("SYSTEM_OPS_TOPIC_ARN"),
-        {"type": messages.MARK_STOCK_DELETED, "account_id": account_id, "symbol": symbol},
+        {
+            "type": messages.MARK_STOCK_DELETED,
+            "account_id": account_id,
+            "symbol": symbol,
+            "op_id": uuid.uuid4().hex,
+        },
     )
     return 202, {"message": "delete accepted", "symbol": symbol}
 

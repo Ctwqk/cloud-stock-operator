@@ -111,6 +111,7 @@ class TestCommands:
         status, _ = call("DELETE", "/watchlist/aapl")
         assert status == 202
         [message] = queued(cloud, "CleanupQueue")
+        assert message.pop("op_id")  # travels with the command across SNS/SQS retries
         assert message == {"type": "MARK_STOCK_DELETED", "account_id": ACCOUNT, "symbol": "AAPL"}
 
     @pytest.mark.parametrize(

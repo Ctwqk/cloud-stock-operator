@@ -18,6 +18,7 @@ from aws_cdk import aws_apigateway as apigw
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as targets
+from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as _lambda
 from aws_cdk import aws_lambda_event_sources as lambda_event_sources
 from aws_cdk import aws_logs as logs
@@ -43,6 +44,27 @@ def _retain_data(scope: Construct) -> bool:
 def _removal_policy(scope: Construct) -> RemovalPolicy:
     """DESTROY by default (demo friendly); ``-c retain_data=true`` keeps table and bucket."""
     return RemovalPolicy.RETAIN if _retain_data(scope) else RemovalPolicy.DESTROY
+
+
+def _grant_objects(
+    bucket: s3.IBucket, function: _lambda.Function, prefix: str, *actions: str
+) -> None:
+    function.add_to_role_policy(
+        iam.PolicyStatement(actions=list(actions), resources=[bucket.arn_for_objects(prefix)])
+    )
+
+
+def _grant_news_cleanup(bucket: s3.IBucket, function: _lambda.Function) -> None:
+    _grant_objects(
+        bucket, function, "news/*", "s3:GetObjectTagging", "s3:PutObjectTagging", "s3:DeleteObject"
+    )
+    function.add_to_role_policy(
+        iam.PolicyStatement(
+            actions=["s3:ListBucket"],
+            resources=[bucket.bucket_arn],
+            conditions={"StringLike": {"s3:prefix": "news/*"}},
+        )
+    )
 
 
 class DataStack(Stack):
@@ -183,7 +205,13 @@ class AppStack(Stack):
             },
             dead_letter_queue=async_failures,
         )
-        table.grant_read_write_data(news_fetcher)
+        table.grant(
+            news_fetcher,
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+            "dynamodb:Query",
+        )
         system_topic.grant_publish(news_fetcher)
         fetch_minutes = int(self.node.try_get_context("fetch_interval_minutes") or 5)
         events.Rule(
@@ -202,7 +230,7 @@ class AppStack(Stack):
                 "SYSTEM_OPS_TOPIC_ARN": system_topic.topic_arn,
             },
         )
-        bucket.grant_put(news_writer, "news/*")
+        _grant_objects(bucket, news_writer, "news/*", "s3:PutObject")
         system_topic.grant_publish(news_writer)
 
         # --- Lambda B: sentiment scorer (NEWS_STORED -> score -> AUTO_TRADE_DECISION) -----------
@@ -217,8 +245,9 @@ class AppStack(Stack):
                 "SYSTEM_OPS_TOPIC_ARN": system_topic.topic_arn,
             },
         )
-        table.grant_read_write_data(sentiment_scorer)
-        bucket.grant_read(sentiment_scorer, "news/*")
+        # Transactions use the IAM actions of their constituent Put/Update operations.
+        table.grant(sentiment_scorer, "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem")
+        _grant_objects(bucket, sentiment_scorer, "news/*", "s3:GetObject")
         system_topic.grant_publish(sentiment_scorer)
 
         # --- Lambda D: external ops (ADD_STOCK / ADJUST_*) ---------------------------------
@@ -230,7 +259,13 @@ class AppStack(Stack):
                 "SYSTEM_OPS_TOPIC_ARN": system_topic.topic_arn,
             },
         )
-        table.grant_read_write_data(stock_info_writer)
+        table.grant(
+            stock_info_writer,
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+            "dynamodb:Query",
+        )
         system_topic.grant_publish(stock_info_writer)
 
         # --- Lambda E: soft delete / cleanup -------------------------------------------------
@@ -239,8 +274,8 @@ class AppStack(Stack):
             "soft_delete",
             environment={"TABLE_NAME": table.table_name, "BUCKET_NAME": bucket.bucket_name},
         )
-        table.grant_read_write_data(soft_delete)
-        bucket.grant_read_write(soft_delete, "news/*")
+        table.grant(soft_delete, "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem")
+        _grant_news_cleanup(bucket, soft_delete)
 
         # --- Daily news retention cleaner ----------------------------------------------------
         retention_cleaner = self._function(
@@ -250,8 +285,8 @@ class AppStack(Stack):
             environment={"TABLE_NAME": table.table_name, "BUCKET_NAME": bucket.bucket_name},
             dead_letter_queue=async_failures,
         )
-        table.grant_read_data(retention_cleaner)
-        bucket.grant_read_write(retention_cleaner, "news/*")
+        table.grant(retention_cleaner, "dynamodb:Scan")
+        _grant_news_cleanup(bucket, retention_cleaner)
         events.Rule(
             self,
             "NewsRetentionCleanupRule",
@@ -266,7 +301,7 @@ class AppStack(Stack):
             environment={"TABLE_NAME": table.table_name},
             dead_letter_queue=async_failures,
         )
-        table.grant_read_write_data(snapshot_writer)
+        table.grant(snapshot_writer, "dynamodb:Query", "dynamodb:PutItem", "dynamodb:UpdateItem")
         events.Rule(
             self,
             "NetWorthSnapshotScheduleRule",
@@ -282,9 +317,9 @@ class AppStack(Stack):
             layers=[matplotlib_layer],
             environment={"TABLE_NAME": table.table_name, "BUCKET_NAME": bucket.bucket_name},
         )
-        table.grant_read_data(plotter)
-        bucket.grant_put(plotter, "plots/*")
-        bucket.grant_read(plotter, "plots/*")  # the presigned URL is signed with this role
+        table.grant(plotter, "dynamodb:Query")
+        # The presigned URL is signed with this role, hence GetObject as well as PutObject.
+        _grant_objects(bucket, plotter, "plots/*", "s3:PutObject", "s3:GetObject")
 
         # --- Control-plane API ---------------------------------------------------------------
         control_plane = self._function(
@@ -297,7 +332,7 @@ class AppStack(Stack):
                 "NEWS_FETCHER_NAME": news_fetcher.function_name,
             },
         )
-        table.grant_read_write_data(control_plane)
+        table.grant(control_plane, "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem")
         external_topic.grant_publish(control_plane)
         system_topic.grant_publish(control_plane)
         news_fetcher.grant_invoke(control_plane)

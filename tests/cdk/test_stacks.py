@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
@@ -331,8 +330,49 @@ class TestAppStack:
                     if isinstance(statement["Action"], list)
                     else [statement["Action"]]
                 )
-                assert "*" not in actions
-                assert not any(re.fullmatch(r"[a-z0-9]+:\*", a) for a in actions)
+                assert all("*" not in action for action in actions), actions
+
+    def test_dynamodb_grants_match_handler_operations(self, application):
+        allowed = {
+            "NewsFetcher": {"GetItem", "PutItem", "UpdateItem", "Query"},
+            "SentimentScorer": {"GetItem", "PutItem", "UpdateItem"},
+            "StockInfoWriter": {"GetItem", "PutItem", "UpdateItem", "Query"},
+            "SoftDelete": {"GetItem", "PutItem", "UpdateItem"},
+            "NewsRetentionCleaner": {"Scan"},
+            "NetWorthSnapshotWriter": {"Query", "PutItem", "UpdateItem"},
+            "NetWorthPlotter": {"Query"},
+            "ControlPlaneApi": {"GetItem", "PutItem", "UpdateItem"},
+        }
+        for name, expected in allowed.items():
+            statements = self._statements(application, f"{name}LambdaServiceRole")
+            actions = {
+                action
+                for s in statements
+                for action in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])
+                if action.startswith("dynamodb:")
+            }
+            assert actions == {f"dynamodb:{action}" for action in expected}, name
+
+    def test_only_cleaners_can_list_news_and_cannot_overwrite_objects(self, application):
+        for name in ("SoftDelete", "NewsRetentionCleaner"):
+            statements = self._statements(application, f"{name}LambdaServiceRole")
+            s3_statements = [s for s in statements if "s3:" in str(s["Action"])]
+            actions = {
+                a
+                for s in s3_statements
+                for a in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])
+            }
+            assert actions == {
+                "s3:ListBucket",
+                "s3:GetObjectTagging",
+                "s3:PutObjectTagging",
+                "s3:DeleteObject",
+            }
+            for statement in s3_statements:
+                if "s3:ListBucket" in statement["Action"]:
+                    assert statement["Condition"] == {"StringLike": {"s3:prefix": "news/*"}}
+                else:
+                    assert "/news/*" in str(statement["Resource"])
 
     def test_fetcher_cannot_be_invoked_by_anything_but_the_control_plane_and_events(
         self, application

@@ -21,16 +21,18 @@ output() { # <stack> <output key>
 
 echo "Reading stack outputs from ${REGION}..."
 export AWS_DEFAULT_REGION="${REGION}"
-export TABLE_NAME="$(output DataStack TableName)"
-export BUCKET_NAME="$(output DataStack BucketName)"
-export TRADE_DECISION_QUEUE_URL="$(output MessagingStack TradeDecisionQueueUrl)"
-export MGMT_API_BASE_URL="$(output AppStack ManagementApiUrl)"
-export NETWORTH_API_BASE_URL="$(output AppStack NetWorthApiUrl)"
+TABLE_NAME="$(output DataStack TableName)"
+BUCKET_NAME="$(output DataStack BucketName)"
+TRADE_DECISION_QUEUE_URL="$(output MessagingStack TradeDecisionQueueUrl)"
+MGMT_API_BASE_URL="$(output AppStack ManagementApiUrl)"
+NETWORTH_API_BASE_URL="$(output AppStack NetWorthApiUrl)"
 API_KEY_ID="$(output AppStack ApiKeyId)"
-export MGMT_API_KEY="$(aws apigateway get-api-key --api-key "${API_KEY_ID}" --include-value \
+MGMT_API_KEY="$(aws apigateway get-api-key --api-key "${API_KEY_ID}" --include-value \
   --region "${REGION}" --query value --output text)"
+export TABLE_NAME BUCKET_NAME TRADE_DECISION_QUEUE_URL MGMT_API_BASE_URL NETWORTH_API_BASE_URL
+export MGMT_API_KEY
 
-for name in TABLE_NAME BUCKET_NAME TRADE_DECISION_QUEUE_URL MGMT_API_BASE_URL NETWORTH_API_BASE_URL; do
+for name in TABLE_NAME BUCKET_NAME TRADE_DECISION_QUEUE_URL MGMT_API_BASE_URL NETWORTH_API_BASE_URL MGMT_API_KEY; do
   if [ -z "${!name}" ] || [ "${!name}" = "None" ]; then
     echo "Could not read ${name} from the stacks; are they deployed in ${REGION}?" >&2
     exit 1

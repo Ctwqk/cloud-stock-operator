@@ -182,6 +182,7 @@ cd cdk
 export CDK_DEFAULT_ACCOUNT=<account-id> CDK_DEFAULT_REGION=<region>
 uv run --project .. -- npx aws-cdk@2 bootstrap                       # once per account/region
 uv run --project .. -- npx aws-cdk@2 deploy --all                    # optional: -c fetch_interval_minutes=15 -c retain_data=true
+cd ..                                                              # return to the repository root
 ```
 
 `cdk synth` works without the layers (it substitutes empty placeholders and prints a warning); a deploy needs them. Afterwards run the UI and the trade worker against the stack: `AWS_REGION=<region> ./local_app/run_against_aws.sh` (reads the CloudFormation outputs, fetches the API key value, starts `docker-compose.aws.yml`). `cdk destroy --all` removes everything unless `retain_data=true` was set.

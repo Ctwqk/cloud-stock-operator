@@ -233,4 +233,18 @@ class TestSynchronousWrites:
         assert body["message"] == "duplicate ignored" and body["new_score"] == 1
 
     def test_sentiment_for_unknown_symbol_is_404(self, cloud):
-        assert call("POST", "/sentiment", {"symbol": "NOPE", "delta_score": 1})[0] == 404
+        body = {"symbol": "NOPE", "delta_score": 1, "event_id": "missing-stock"}
+        assert call("POST", "/sentiment", body)[0] == 404
+
+    @pytest.mark.parametrize("event_id", [None, "", "  ", 123, [], {}])
+    def test_sentiment_requires_a_stable_event_id(self, cloud, table, event_id):
+        add_stock(table)
+        body = {"symbol": "AAPL", "delta_score": 1}
+        if event_id is not None:
+            body["event_id"] = event_id
+        status, response = call("POST", "/sentiment", body)
+        assert status == 400 and "event_id" in response["error"]
+        assert queued(cloud, "TradeDecisionQueue") == []
+        assert (
+            table.get_item(Key={"PK": PK, "SK": "STOCK#AAPL"})["Item"]["current_level_score"] == 0
+        )

@@ -207,13 +207,15 @@ def apply_sentiment(account_id: str, body: dict[str, Any], params: dict[str, str
     delta = _integer(body, "delta_score")
     if not -10 <= delta <= 10:
         raise ApiError(400, "delta_score must be between -10 and 10")
+    event_id = body.get("event_id")
+    if not isinstance(event_id, str) or not event_id.strip():
+        raise ApiError(400, "event_id must be a nonempty stable string")
     result = scoring.apply_sentiment(
         account_id=account_id,
         symbol=symbol,
         delta=delta,
         reason=str(body.get("reason", "EXTERNAL"))[:50],
-        # Callers that may retry should pass a stable event_id to make the call idempotent.
-        dedupe_id=f"api:{body.get('event_id') or uuid.uuid4().hex}",
+        dedupe_id=f"api:{event_id}",
         topic_arn=aws.require_env("SYSTEM_OPS_TOPIC_ARN"),
         headline=str(body.get("headline", "")),
     )

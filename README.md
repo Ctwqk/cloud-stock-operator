@@ -2,7 +2,7 @@
 
 A serverless, event-driven watchlist and **paper-trading** system on AWS, defined with the AWS CDK (Python): news for the stocks you follow is fetched, scored for sentiment, and turned into virtual BUY/SELL decisions through SNS/SQS fan-out, nine Lambda functions and a single DynamoDB table. The whole pipeline also runs locally in Docker, with no AWS account.
 
-[![CI](https://github.com/Ctwqk/cloud-stock-operator/actions/workflows/ci.yml/badge.svg?branch=portfolio-upgrade)](https://github.com/Ctwqk/cloud-stock-operator/actions/workflows/ci.yml)
+[![CI](https://github.com/Ctwqk/cloud-stock-operator/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Ctwqk/cloud-stock-operator/actions/workflows/ci.yml)
 
 ![Control panel of the local demo: watchlist with sentiment scores, virtual trades and the net-worth chart](docs/screenshot.png)
 
@@ -255,4 +255,4 @@ Everything is pay-per-use (DynamoDB on-demand, Lambda, SQS, SNS, S3, API Gateway
 
 ## License
 
-No license file has been chosen yet; all rights reserved by default until the owner adds one.
+Released under the [MIT License](LICENSE).

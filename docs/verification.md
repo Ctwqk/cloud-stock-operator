@@ -30,7 +30,7 @@ per-service memory limits. Stack startup, browser capture and teardown shared on
 
 The [CI workflow](../.github/workflows/ci.yml) independently runs lint, the coverage-gated
 suite, credential-free synthesis, layer builds and the Compose smoke test on pushes and PRs.
-See [branch runs](https://github.com/Ctwqk/cloud-stock-operator/actions/workflows/ci.yml?query=branch%3Aportfolio-upgrade)
+See [branch runs](https://github.com/Ctwqk/cloud-stock-operator/actions/workflows/ci.yml?query=branch%3Amain)
 for the latest result.
 
 Real AWS deployment/IAM behavior and live yfinance availability remain unverified.

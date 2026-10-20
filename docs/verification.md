@@ -6,7 +6,7 @@ environment, built layers, or CDK output. No AWS account credentials or deployme
 | Command / check | Result |
 |---|---|
 | `make install` | Locked environment installed on Python 3.12.7 |
-| `make lint` | Ruff lint and format checks passed (63 Python files) |
+| `make lint` | Ruff lint and format checks passed |
 | `uv run --no-sync pytest --cov --cov-report=term:skip-covered --cov-fail-under=85` | **308 passed**, 91.68% coverage, 90.14 seconds on this host |
 | `UV_OFFLINE=1 npm_config_offline=true make synth` | All three stacks synthesized using cached tools, with missing-layer warnings as documented |
 | `./scripts/build_layers.sh` | Linux x86_64 / Python 3.12 wheels built: matplotlib 125 MiB, sentiment 3 MiB, yfinance 142 MiB; each below the size gate |
@@ -34,3 +34,53 @@ See [branch runs](https://github.com/Ctwqk/cloud-stock-operator/actions/workflow
 for the latest result.
 
 Real AWS deployment/IAM behavior and live yfinance availability remain unverified.
+
+## Independent review — 2026-10-19 (America/Los_Angeles)
+
+Compared the upgrade at `37452c1` with default-branch commit `171ce0e`. A fresh source
+checkout passed the documented `make install`, `make lint`, `make test` (308 tests) and
+`make synth`. The original CI test log independently confirms 308 tests and 91.68% coverage.
+
+Findings fixed during review:
+
+* **P1:** S3 cleanup failures left stocks active, old delete deliveries deactivated re-added
+  stocks, and share adjustments could commit after a concurrent deletion. Deletion now commits
+  with an operation marker before cleanup; retries preserve reactivation, unknown stocks leave
+  S3 untouched, and share transactions guard the deleted flag (`a93de87`).
+* **P2:** The sentiment API generated new deduplication IDs for requests without `event_id`,
+  allowing retries to apply the delta again. It now rejects missing/invalid IDs (`c5036a7`).
+* **P2:** Broad CDK grants allowed unnecessary DynamoDB deletes and S3 object writes/listing;
+  the old wildcard assertion missed patterns such as `GetObject*`. Application policies now
+  list the required actions, and cleanup listing is restricted to `news/*` (`5826865`).
+* **P2/P3:** The AWS launcher swallowed failed API-key lookups and started containers anyway;
+  the deploy instructions also left the shell in the wrong directory. The launcher now stops
+  on CLI failures and empty keys, with isolated CLI-stub regressions (`a5ba788`).
+
+| Review verification | Result |
+|---|---|
+| Full suite with `--cov --cov-report=term-missing:skip-covered --cov-fail-under=85` | **322 passed**, **91.52%** coverage |
+| Ruff lint and formatting | Passed, 65 Python files |
+| `make layers` and isolated Python 3.12 container imports | matplotlib 125 MiB, sentiment 3 MiB, yfinance 142 MiB; all three imported with networking disabled |
+| `UV_OFFLINE=1 npm_config_offline=true make synth` | All three stacks synthesized with built layers and credential files disabled |
+| CDK CLI synthesis in a container with `--network=none` | All three stacks synthesized with built layers |
+| `CAPTURE_SCREENSHOT=1 SKIP_BUILD=1 WEB_PORT=41783 make smoke` | Five stocks, nine executed virtual trades, three plotted snapshots; no page errors; 285,445-byte review capture |
+
+The original committed screenshot is retained because the UI did not change. The first review
+capture hit a Chromium startup failure with a long nested temporary path; shortening the
+review `TMPDIR` allowed the same cached browser to start and complete the capture. Both smoke
+runs tore down their stacks. All heavy review steps held the shared lock and ran in a user
+systemd scope with `MemoryMax=6G` / `MemorySwapMax=0`, after checking for at least 8 GiB available.
+Docker builds/offline synthesis used 1.5 GiB caps, layer imports 512 MiB, and the demo used its
+committed per-service caps. No production containers were modified.
+
+The deletion regressions failed before their fixes; the sentiment validation, synthesized
+IAM policy and launcher failure paths also had independent failing reproductions. The review
+found no AWS access-key/private-key signatures in the current or default-branch trees and no
+tracked files over 1 MiB. The 99-term sentiment extension is deterministic; these tests do not
+establish predictive accuracy or profitability.
+
+IAM action selection follows the AWS documentation for
+[DynamoDB transaction permissions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html)
+and [S3 listing prefix conditions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/amazon-s3-policy-keys.html).
+No AWS resources were deployed. Emulator tests do not validate real IAM enforcement,
+service-side transaction conflicts, TTL expiry or Lambda event-source delivery timing.

@@ -126,7 +126,7 @@ All items of one tenant share a partition: `PK = ACCOUNT#<account_id>` (the AWS 
 | `SCORE#<SYMBOL>#<ts>` | sentiment history per stock | scorer |
 | `NEWSHASH#<SYMBOL>#<hash>` | "news already seen" marker, TTL | fetcher |
 | `SCORED#<news_id>` | scoring result and immutable decision payload for delivery retries, TTL | scoring |
-| `OP#<op_id>` | outcome of an asynchronous command (`APPLIED`/`REJECTED`), TTL | `stock_info_writer` |
+| `OP#<op_id>` | outcome of an asynchronous command (`APPLIED`/`REJECTED`), TTL | `stock_info_writer`, `soft_delete` |
 | `DECISION#<decision_id>` | "trade already executed" marker, TTL | trade worker |
 
 The table has TTL enabled on the `ttl` attribute. S3 keys: `news/<SYMBOL>/<yyyy-mm-dd>/<news_id>.json` and `plots/networth/<account>/<uuid>.png`.
@@ -185,7 +185,7 @@ uv run --project .. -- npx aws-cdk@2 deploy --all                    # optional:
 cd ..                                                              # return to the repository root
 ```
 
-`cdk synth` works without the layers (it substitutes empty placeholders and prints a warning); a deploy needs them. Afterwards run the UI and the trade worker against the stack: `AWS_REGION=<region> ./local_app/run_against_aws.sh` (reads the CloudFormation outputs, fetches the API key value, starts `docker-compose.aws.yml`). `cdk destroy --all` removes everything unless `retain_data=true` was set.
+`cdk synth` works without the layers (it substitutes empty placeholders and prints a warning); a deploy needs them. Afterwards run the UI and the trade worker from the repository root: `AWS_REGION=<region> ./local_app/run_against_aws.sh` (reads the CloudFormation outputs, fetches the API key value, starts `docker-compose.aws.yml`). The launcher requires the AWS CLI and a configured, container-readable `~/.aws` profile (select with `AWS_PROFILE`); environment-only credentials are not forwarded to these containers. To remove the stacks from the repository root, use `cd cdk && uv run --project .. -- npx aws-cdk@2 destroy --all`; data is retained if `retain_data=true` was set at deployment.
 
 The APIs require an API key (usage plan: 10 req/s, burst 20). That is a shared secret, not user authentication.
 
@@ -216,7 +216,7 @@ Each Lambda is packaged from `lambda/`: its own package plus `common/` (the CDK 
 
 * every Lambda handler against moto (DynamoDB, S3, SNS, SQS, STS) with realistic event shapes (SNS-in-SQS envelope, API Gateway proxy, EventBridge scheduled event, yfinance payloads) kept under `tests/fixtures/`;
 * regression tests for each bug listed below;
-* CDK assertion tests on the synthesized templates (DLQ + redrive on every queue, one filter policy per queue, `ReportBatchItemFailures`, API keys, least-privilege S3 prefixes, no wildcard actions, queue visibility >= 6x function timeout, asset contents) and a test that runs the whole pipeline with each Lambda seeing **only** the environment variables CDK declares for it;
+* CDK assertion tests on the synthesized templates (DLQ + redrive on every queue, one filter policy per queue, `ReportBatchItemFailures`, API keys, exact DynamoDB operations per handler, S3 object and listing prefixes, no wildcard actions in application policies, queue visibility >= 6x function timeout, asset contents) and a test that runs the whole pipeline with each Lambda seeing **only** the environment variables CDK declares for it;
 * end-to-end tests: API call -> SNS/SQS -> fetcher -> writer -> scorer -> decision -> trade worker -> net worth, plus the web UI over real HTTP with background poller threads.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): ruff lint and format check; pytest with a coverage gate; `cdk synth` with the CLI; layer build and size check; the docker compose smoke test.
@@ -226,7 +226,8 @@ See the [verification record](docs/verification.md) for commands, measured cover
 ## Design notes and trade-offs
 
 * **At-least-once delivery is assumed everywhere.** Commands carry an `op_id`; the state change and an `OP#` marker are written in one DynamoDB transaction. News ids are content hashes (deterministic S3 key, `SCORED#` marker). Trade decisions carry a deterministic `decision_id`, and the worker executes cash, shares, trade log and a `DECISION#` marker in a single transaction. Handlers return per-message failures (`ReportBatchItemFailures`), so one bad message is retried and eventually dead-lettered without replaying the batch.
-* **Balance commands go through the queue.** Add-stock, cash and share deltas are validated by the API, applied by `stock_info_writer` with optimistic concurrency, and answered with `202` + `GET /operations/{id}`. Threshold settings and externally supplied sentiment stay synchronous. Sentiment is a delta: callers must supply a stable `event_id` when retrying `POST /sentiment`.
+* **Balance commands go through the queue.** Add-stock, cash and share deltas are validated by the API, applied by `stock_info_writer` with optimistic concurrency, and answered with `202` + `GET /operations/{id}`. Threshold settings and externally supplied sentiment stay synchronous. Sentiment is a delta: `POST /sentiment` requires a nonempty string `event_id`, unique within the account and reused on retries.
+* **Deletion precedes cleanup.** The deleted flag and an operation marker are committed together before touching S3, so cleanup failures leave the stock ineligible for trades and still retry through SQS/DLQ. A redelivered delete cannot deactivate a subsequently re-added stock. `deleted_news_count` counts a completed cleanup pass once; it can undercount work done before a partial failure or by the daily cleaner.
 * **A decision consumes the score atomically.** The score resets to 0, `decision_count` advances, and the immutable decision payload is saved on the `SCORED#` marker in one transaction. A failed or ambiguous SNS publish replays that payload on redelivery, even after other headlines arrive. Optimistic conditions protect the score, threshold and decision counter from concurrent changes. The worker requires a stable decision ID and a positive whole-number quantity.
 * **Sentiment is a lexicon, on purpose.** VADER plus ~100 finance terms is deterministic, tiny (fits a layer, no model download) and testable. It sits behind `SentimentScorer`; a model-backed scorer can be added to `BACKENDS`. It looks at one headline and summary at a time and misses context and sarcasm.
 * **The local runtime reuses the production wiring.** `local_cloud.py` builds queues and filter subscriptions from the same `topology.py` as the CDK stack and calls the real handlers, so the demo exercises the deployed routing rather than a re-implementation. moto is not AWS, though: see below.
@@ -240,11 +241,11 @@ See the [verification record](docs/verification.md) for commands, measured cover
 
 ## Known limitations and roadmap
 
-* **Not deployed or verified on real AWS** (no credentials were available): correctness rests on moto, CDK assertions and `cdk synth`. IAM completeness, API Gateway behaviour and real SNS filtering are untested.
+* **Not deployed or verified on real AWS** (no credentials were available): correctness rests on moto, CDK assertions and `cdk synth`. Real IAM enforcement, API Gateway behaviour, TTL expiry, service-side transaction conflicts, and SNS/SQS delivery timing remain untested. Local pollers implement partial-batch acknowledgement; moto does not run AWS Lambda event source mappings or asynchronous invocation retries.
 * Live yfinance is not exercised in CI or the deterministic demo. Provider tests use recorded payloads, including the `Ticker.news` / `yf.Search` fallback. yfinance is an unofficial API and can break.
 * Single tenant: the account id is the AWS account id, and S3 news keys are not account-scoped (a soft delete affects every account's news for that symbol).
 * The API key is a shared secret; there is no per-user auth. No CloudWatch alarms on the DLQs.
-* Standard SQS queues can deliver decisions out of order. Deduplication is bounded by marker retention (30 days for commands, 45 days for scoring/trades); replay failed deliveries from the DLQ before those markers expire. Cached summary valuations are eventually consistent with concurrent trades and price changes.
+* Standard SQS queues can deliver commands and decisions out of order; wait for a dependent command's applied state before issuing the next one. Deduplication is bounded by marker retention (30 days for commands, 45 days for scoring/trades); replay failed deliveries from the DLQ before those markers expire. Cached summary valuations are eventually consistent with concurrent trades and price changes.
 * The retention cleaner scans the table once a day; fine at this size, not at scale.
 * Roadmap ideas: alarms on DLQ depth, Cognito/IAM auth, a model-backed scorer behind the same interface, account-scoped S3 keys, a read API so the UI does not need DynamoDB credentials.
 
